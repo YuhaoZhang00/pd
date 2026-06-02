@@ -620,10 +620,6 @@ func (gc *groupCostController) onRequestWaitImpl(
 		calc.BeforeKVRequest(delta, info)
 	}
 
-	gc.mu.Lock()
-	add(gc.mu.consumption, delta)
-	gc.mu.Unlock()
-
 	if !gc.burstable.Load() {
 		d, err := gc.acquireTokens(ctx, delta, &waitDuration, false)
 		if err != nil {
@@ -633,9 +629,6 @@ func (gc *groupCostController) onRequestWaitImpl(
 			} else {
 				gc.metrics.failedRequestCounterWithOthers.Inc()
 			}
-			gc.mu.Lock()
-			sub(gc.mu.consumption, delta)
-			gc.mu.Unlock()
 			failpoint.Inject("triggerUpdate", func() {
 				gc.lowRUNotifyChan <- notifyMsg{}
 			})
@@ -644,6 +637,10 @@ func (gc *groupCostController) onRequestWaitImpl(
 		gc.metrics.successfulRequestDuration.Observe(d.Seconds())
 		waitDuration += d
 	}
+	gc.mu.Lock()
+	add(gc.mu.consumption, delta)
+	gc.mu.Unlock()
+
 	if bytesForEst := estimatedReadBytes(info); bytesForEst > 0 {
 		gc.metrics.observePagingPrecharge(bytesForEst, getRUValueFromConsumption(delta))
 	}

@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
@@ -584,15 +584,24 @@ func TestPagingPrechargeNotObservedOnThrottle(t *testing.T) {
 	}
 
 	before := counterValue(re, gc.metrics.prechargeCounter)
+	gc.mu.Lock()
+	consumptionBefore := gc.mu.consumption.RRU
+	gc.mu.Unlock()
+
 	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
 	re.Error(err)
 	re.True(errs.ErrClientResourceGroupThrottled.Equal(err))
 	after := counterValue(re, gc.metrics.prechargeCounter)
+	gc.mu.Lock()
+	consumptionAfter := gc.mu.consumption.RRU
+	gc.mu.Unlock()
 
 	// Throttled requests never reach OnResponse for settlement, so the
 	// precharge counter must not be incremented either.
 	re.Equal(before, after,
 		"throttled paging request should not inflate PagingPrechargeCounter")
+	re.InDelta(consumptionBefore, consumptionAfter, 1e-6,
+		"throttled paging request should not enter consumption before admission")
 }
 
 func TestAcquireTokensSignalAwareWait(t *testing.T) {

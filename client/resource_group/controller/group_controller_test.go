@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
@@ -215,6 +215,79 @@ func TestOnResponseWaitConsumption(t *testing.T) {
 	re.NoError(err)
 	re.NotZero(waitTIme)
 	verify()
+}
+
+func TestRequestConsumptionRecordedAfterAdmission(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	cfg := DefaultRUConfig()
+	targetRU := 200.0
+	predictedReadBytes := uint64(targetRU / float64(cfg.ReadBytesCost))
+	req := &TestRequestInfo{
+		isWrite:            false,
+		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
+	}
+	expected := &rmpb.Consumption{}
+	gc.getKVCalculator().BeforeKVRequest(expected, req)
+
+	now := time.Now()
+	gc.run.requestUnitTokens.limiter.Reconfigure(now, tokenBucketReconfigureArgs{
+		newTokens:   0,
+		newFillRate: 0,
+		newBurst:    -1,
+	})
+	gc.run.requestUnitTokens.limiter.Reconfigure(now, tokenBucketReconfigureArgs{
+		newTokens:   0,
+		newFillRate: 1000,
+		newBurst:    1000,
+	})
+	gc.burstable.Store(false)
+
+	type requestResult struct {
+		delta        *rmpb.Consumption
+		waitDuration time.Duration
+		err          error
+	}
+	done := make(chan requestResult, 1)
+	go func() {
+		delta, _, waitDuration, _, err := gc.onRequestWaitImpl(context.Background(), req)
+		done <- requestResult{
+			delta:        delta,
+			waitDuration: waitDuration,
+			err:          err,
+		}
+	}()
+
+	re.Eventually(func() bool {
+		gc.run.requestUnitTokens.limiter.mu.Lock()
+		defer gc.run.requestUnitTokens.limiter.mu.Unlock()
+		return len(gc.run.requestUnitTokens.limiter.futureReservations) > 0
+	}, 100*time.Millisecond, time.Millisecond)
+
+	gc.mu.Lock()
+	consumptionDuringWait := gc.mu.consumption.RRU
+	gc.mu.Unlock()
+	if consumptionDuringWait != 0 {
+		t.Errorf("request precharge should not be recorded before admission, got RRU %v", consumptionDuringWait)
+	}
+
+	var result requestResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not complete after its future reservation delay")
+	}
+	re.NoError(result.err)
+	re.Greater(result.waitDuration, 0*time.Second)
+	re.InDelta(expected.RRU, result.delta.RRU, 1e-6)
+
+	gc.mu.Lock()
+	consumptionAfterAdmission := gc.mu.consumption.RRU
+	gc.mu.Unlock()
+	re.InDelta(expected.RRU, consumptionAfterAdmission, 1e-6,
+		"request precharge should be recorded once admission succeeds")
 }
 
 func TestPredictedReadBytesPreCharge(t *testing.T) {

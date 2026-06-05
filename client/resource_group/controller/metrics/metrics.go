@@ -104,6 +104,12 @@ var (
 	FutureReleasedRU *prometheus.CounterVec
 	// FutureReleaseLag records now-current_time_to_act when a future reservation is released.
 	FutureReleaseLag *prometheus.HistogramVec
+	// FutureReserveFailedCounter counts requests that could not be scheduled
+	// into a future reservation because the required wait exceeded the limit.
+	FutureReserveFailedCounter *prometheus.CounterVec
+	// FutureReserveFailedRU accumulates RU from requests that could not be
+	// scheduled into a future reservation.
+	FutureReserveFailedRU *prometheus.CounterVec
 
 	// LimiterTokensGauge records the local limiter token state.
 	LimiterTokensGauge *prometheus.GaugeVec
@@ -113,6 +119,12 @@ var (
 	LimiterFutureReservedRUGauge *prometheus.GaugeVec
 	// LimiterFutureMaxWaitSecondsGauge records the maximum queued future wait.
 	LimiterFutureMaxWaitSecondsGauge *prometheus.GaugeVec
+	// LimiterFutureReservationsByRUBucketGauge records queued reservation count
+	// grouped by per-reservation RU.
+	LimiterFutureReservationsByRUBucketGauge *prometheus.GaugeVec
+	// LimiterFutureReservedRUByBucketGauge records queued reservation RU grouped
+	// by per-reservation RU.
+	LimiterFutureReservedRUByBucketGauge *prometheus.GaugeVec
 )
 
 func init() {
@@ -376,6 +388,22 @@ func initMetrics(constLabels prometheus.Labels) {
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})
 
+	FutureReserveFailedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserve_failed_total",
+			Help:        "Counter of requests that could not be scheduled into future reservations. The wait_class label is based on required wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReserveFailedRU = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserve_failed_ru_total",
+			Help:        "Sum of RU for requests that could not be scheduled into future reservations. The wait_class label is based on required wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
 	LimiterTokensGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace:   namespace,
@@ -407,6 +435,22 @@ func initMetrics(constLabels prometheus.Labels) {
 			Help:        "Maximum wait time among queued future reservations in the local RC limiter.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})
+
+	LimiterFutureReservationsByRUBucketGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reservations_by_ru_bucket",
+			Help:        "Number of queued future reservations grouped by per-reservation RU bucket.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "bucket"})
+
+	LimiterFutureReservedRUByBucketGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reserved_ru_by_bucket",
+			Help:        "Total queued RU in future reservations grouped by per-reservation RU bucket.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "bucket"})
 }
 
 // InitAndRegisterMetrics initializes and register metrics.
@@ -439,8 +483,12 @@ func InitAndRegisterMetrics(constLabels prometheus.Labels) {
 	prometheus.MustRegister(FutureReleasedCounter)
 	prometheus.MustRegister(FutureReleasedRU)
 	prometheus.MustRegister(FutureReleaseLag)
+	prometheus.MustRegister(FutureReserveFailedCounter)
+	prometheus.MustRegister(FutureReserveFailedRU)
 	prometheus.MustRegister(LimiterTokensGauge)
 	prometheus.MustRegister(LimiterFutureReservationsGauge)
 	prometheus.MustRegister(LimiterFutureReservedRUGauge)
 	prometheus.MustRegister(LimiterFutureMaxWaitSecondsGauge)
+	prometheus.MustRegister(LimiterFutureReservationsByRUBucketGauge)
+	prometheus.MustRegister(LimiterFutureReservedRUByBucketGauge)
 }

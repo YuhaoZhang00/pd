@@ -112,13 +112,37 @@ type limiterMetricsCollection struct {
 }
 
 type limiterDebugSnapshot struct {
-	Tokens           float64
-	FillRate         float64
-	Burst            int64
-	FutureCount      int
-	FutureReservedRU float64
-	FutureMinWait    time.Duration
-	FutureMaxWait    time.Duration
+	Tokens               float64
+	FillRate             float64
+	Burst                int64
+	FutureCount          int
+	FutureReservedRU     float64
+	FutureMinWait        time.Duration
+	FutureMaxWait        time.Duration
+	FutureRUBucketCount  map[string]int
+	FutureRUBucketTokens map[string]float64
+}
+
+var futureRUBucketBounds = []struct {
+	label string
+	upper float64
+}{
+	{label: "le_1", upper: 1},
+	{label: "1_16", upper: 16},
+	{label: "16_64", upper: 64},
+	{label: "64_128", upper: 128},
+	{label: "128_240", upper: 240},
+	{label: "240_280", upper: 280},
+	{label: "gt_280", upper: math.Inf(1)},
+}
+
+func futureRUBucket(tokens float64) string {
+	for _, bucket := range futureRUBucketBounds {
+		if tokens <= bucket.upper {
+			return bucket.label
+		}
+	}
+	return futureRUBucketBounds[len(futureRUBucketBounds)-1].label
 }
 
 // NewLimiter returns a new Limiter that allows events up to rate r and permits
@@ -579,8 +603,15 @@ func (lim *Limiter) debugSnapshotLocked(now time.Time) limiterDebugSnapshot {
 		if reservation == nil || !reservation.inFutureQueue || reservation.canceled {
 			continue
 		}
+		if snap.FutureRUBucketCount == nil {
+			snap.FutureRUBucketCount = make(map[string]int, len(futureRUBucketBounds))
+			snap.FutureRUBucketTokens = make(map[string]float64, len(futureRUBucketBounds))
+		}
 		snap.FutureCount++
 		snap.FutureReservedRU += reservation.tokens
+		bucket := futureRUBucket(reservation.tokens)
+		snap.FutureRUBucketCount[bucket]++
+		snap.FutureRUBucketTokens[bucket] += reservation.tokens
 		wait := reservation.timeToAct.Sub(now)
 		if wait < 0 {
 			wait = 0
@@ -604,6 +635,12 @@ func (lim *Limiter) observeDebugStateLocked(now time.Time, event string, amount 
 	metrics.LimiterFutureReservationsGauge.WithLabelValues(lim.name).Set(float64(snap.FutureCount))
 	metrics.LimiterFutureReservedRUGauge.WithLabelValues(lim.name).Set(snap.FutureReservedRU)
 	metrics.LimiterFutureMaxWaitSecondsGauge.WithLabelValues(lim.name).Set(snap.FutureMaxWait.Seconds())
+	for _, bucket := range futureRUBucketBounds {
+		metrics.LimiterFutureReservationsByRUBucketGauge.WithLabelValues(lim.name, bucket.label).
+			Set(float64(snap.FutureRUBucketCount[bucket.label]))
+		metrics.LimiterFutureReservedRUByBucketGauge.WithLabelValues(lim.name, bucket.label).
+			Set(snap.FutureRUBucketTokens[bucket.label])
+	}
 	if releaseObservabilityLogEnabled() {
 		log.Info("rc_limiter_state",
 			zap.Int64("ts_unix_nano", now.UnixNano()),
@@ -747,6 +784,26 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 		}
 		lim.maybeNotify()
 	} else {
+		if lim.name != "" {
+			waitClass := admissionWaitClass(waitDuration)
+			metrics.FutureReserveFailedCounter.WithLabelValues(lim.name, waitClass).Inc()
+			metrics.FutureReserveFailedRU.WithLabelValues(lim.name, waitClass).Add(n)
+			if releaseObservabilityLogEnabled() {
+				snap := lim.observeDebugStateLocked(now, "reserve_failed", n, 0)
+				log.Info("rc_future_reserve_failed",
+					zap.Int64("ts_unix_nano", now.UnixNano()),
+					zap.String("limiter", lim.name),
+					zap.Float64("request_ru", n),
+					zap.Float64("remaining_tokens", tokens),
+					zap.Float64("fill_rate", float64(lim.fillRate)),
+					zap.Int64("burst", lim.burst),
+					zap.Duration("need_wait", waitDuration),
+					zap.Duration("max_wait", maxFutureReserve),
+					zap.Int("future_count", snap.FutureCount),
+					zap.Float64("future_reserved_ru", snap.FutureReservedRU),
+					zap.Duration("future_max_wait", snap.FutureMaxWait))
+			}
+		}
 		// print log if the limiter cannot reserve for a while.
 		if time.Since(lim.last) > reserveWarnLogInterval {
 			log.Warn("[resource group controller] cannot reserve enough tokens",

@@ -716,7 +716,7 @@ func TestAcquireTokensSignalAwareWait(t *testing.T) {
 	resultCh := make(chan acquireResult, 1)
 	go func() {
 		var waitDuration time.Duration
-		_, err := gc.acquireTokens(context.Background(), delta, &waitDuration, false)
+		_, err := gc.acquireTokens(context.Background(), delta, &waitDuration, false, nil)
 		resultCh <- acquireResult{err, waitDuration}
 	}()
 
@@ -764,7 +764,7 @@ func TestAcquireTokensFallbackToTimer(t *testing.T) {
 	delta := &rmpb.Consumption{RRU: 5000}
 	ctx := context.Background()
 	var waitDuration time.Duration
-	_, err := gc.acquireTokens(ctx, delta, &waitDuration, false)
+	_, err := gc.acquireTokens(ctx, delta, &waitDuration, false, nil)
 
 	// Without a Reconfigure signal, all retries should exhaust and return an error.
 	re.Error(err)

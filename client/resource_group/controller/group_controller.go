@@ -236,6 +236,10 @@ func admissionWaitClass(d time.Duration) string {
 	}
 }
 
+func releaseObservabilityLogEnabled() bool {
+	return true
+}
+
 type tokenCounter struct {
 	fillRate uint64
 
@@ -665,7 +669,7 @@ func (gc *groupCostController) observePagingAdmissionTime(info RequestInfo, delt
 	waitClass := admissionWaitClass(waitDuration)
 	snap := gc.run.requestUnitTokens.limiter.debugSnapshot(now)
 	gc.metrics.observePagingAdmissionTime(gc.name, waitClass, bytesForEst, prechargeRU, snap)
-	if enableControllerTraceLog.Load() {
+	if releaseObservabilityLogEnabled() {
 		log.Info("rc_paging_admit",
 			zap.Int64("ts_unix_nano", now.UnixNano()),
 			zap.String("resource_group", gc.name),
@@ -686,7 +690,7 @@ func (gc *groupCostController) observePagingAdmissionTime(info RequestInfo, delt
 
 func (gc *groupCostController) logPagingSettlementDebug(req RequestInfo, resp ResponseInfo, count, delta *rmpb.Consumption, before, after limiterDebugSnapshot) {
 	bytesForEst := estimatedReadBytes(req)
-	if bytesForEst == 0 || !enableControllerTraceLog.Load() {
+	if bytesForEst == 0 || !releaseObservabilityLogEnabled() {
 		return
 	}
 	deltaRU := getRUValueFromConsumption(delta)

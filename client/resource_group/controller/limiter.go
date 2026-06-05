@@ -604,7 +604,7 @@ func (lim *Limiter) observeDebugStateLocked(now time.Time, event string, amount 
 	metrics.LimiterFutureReservationsGauge.WithLabelValues(lim.name).Set(float64(snap.FutureCount))
 	metrics.LimiterFutureReservedRUGauge.WithLabelValues(lim.name).Set(snap.FutureReservedRU)
 	metrics.LimiterFutureMaxWaitSecondsGauge.WithLabelValues(lim.name).Set(snap.FutureMaxWait.Seconds())
-	if enableControllerTraceLog.Load() {
+	if releaseObservabilityLogEnabled() {
 		log.Info("rc_limiter_state",
 			zap.Int64("ts_unix_nano", now.UnixNano()),
 			zap.String("limiter", lim.name),
@@ -729,7 +729,7 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 			waitClass := admissionWaitClass(waitDuration)
 			metrics.FutureReservedCounter.WithLabelValues(lim.name, waitClass).Inc()
 			metrics.FutureReservedRU.WithLabelValues(lim.name, waitClass).Add(n)
-			if enableControllerTraceLog.Load() {
+			if releaseObservabilityLogEnabled() {
 				log.Info("rc_future_reserved",
 					zap.Int64("ts_unix_nano", now.UnixNano()),
 					zap.String("limiter", lim.name),
@@ -882,7 +882,7 @@ func WaitReservations(ctx context.Context, now time.Time, reservations []*Reserv
 					metrics.FutureReleasedCounter.WithLabelValues(res.lim.name, waitClass).Inc()
 					metrics.FutureReleasedRU.WithLabelValues(res.lim.name, waitClass).Add(res.tokens)
 					metrics.FutureReleaseLag.WithLabelValues(res.lim.name).Observe(nowForRelease.Sub(res.timeToAct).Seconds())
-					if enableControllerTraceLog.Load() {
+					if releaseObservabilityLogEnabled() {
 						log.Info("rc_future_released",
 							zap.Int64("ts_unix_nano", nowForRelease.UnixNano()),
 							zap.String("limiter", res.lim.name),

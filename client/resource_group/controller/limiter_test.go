@@ -115,6 +115,39 @@ func TestSimpleReserve(t *testing.T) {
 	runReserveMax(t, lim, request{t5, 2000, t5, true})
 }
 
+func TestLimiterDebugSnapshotTracksFutureReservations(t *testing.T) {
+	re := require.New(t)
+	t0 := time.Unix(100, 0)
+	lim := NewLimiter(t0, 100, 0, 0, nil)
+
+	r1 := lim.reserveN(t0, 1000, InfDuration)
+	r2 := lim.reserveN(t0, 500, InfDuration)
+	re.True(r1.reserved)
+	re.True(r2.reserved)
+
+	snap := lim.debugSnapshot(t0)
+	re.Equal(2, snap.FutureCount)
+	re.InDelta(1500, snap.FutureReservedRU, 1e-6)
+	re.Equal(10*time.Second, snap.FutureMinWait)
+	re.Equal(15*time.Second, snap.FutureMaxWait)
+}
+
+func TestFutureReservationDebugTimes(t *testing.T) {
+	re := require.New(t)
+	t0 := time.Unix(100, 0)
+	lim := NewLimiter(t0, 100, 0, 0, nil)
+
+	r := lim.reserveN(t0, 1000, InfDuration)
+	re.True(r.reserved)
+	re.Equal(t0, r.reservedAt)
+	re.Equal(t0.Add(10*time.Second), r.originalTimeToAct)
+	re.Equal(r.originalTimeToAct, r.timeToAct)
+
+	lim.RefundTokens(t0.Add(time.Second), 500)
+	re.Equal(t0.Add(10*time.Second), r.originalTimeToAct,
+		"originalTimeToAct should keep the initial schedule for debug comparison")
+}
+
 func TestReconfig(t *testing.T) {
 	re := require.New(t)
 	lim := NewLimiter(t0, 1, 0, 2, make(chan notifyMsg, 1))

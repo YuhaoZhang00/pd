@@ -290,6 +290,16 @@ func TestRequestConsumptionRecordedAfterAdmission(t *testing.T) {
 		"request precharge should be recorded once admission succeeds")
 }
 
+func TestAdmissionWaitClass(t *testing.T) {
+	re := require.New(t)
+	re.Equal("0", admissionWaitClass(0))
+	re.Equal("0_1s", admissionWaitClass(time.Second))
+	re.Equal("1_5s", admissionWaitClass(5*time.Second))
+	re.Equal("5_20s", admissionWaitClass(20*time.Second))
+	re.Equal("20_60s", admissionWaitClass(60*time.Second))
+	re.Equal("60s_plus", admissionWaitClass(61*time.Second))
+}
+
 func TestPredictedReadBytesPreCharge(t *testing.T) {
 	re := require.New(t)
 	cfg := DefaultRUConfig()

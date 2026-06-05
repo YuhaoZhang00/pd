@@ -120,6 +120,8 @@ type groupMetricsCollection struct {
 	settlementRUDelta       prometheus.Observer
 }
 
+var admissionWaitClasses = []string{"0", "0_1s", "1_5s", "5_20s", "20_60s", "60s_plus"}
+
 func initMetrics(oldName, name string) *groupMetricsCollection {
 	const (
 		otherType     = "others"
@@ -163,6 +165,20 @@ func (gmc *groupMetricsCollection) deletePagingLabels(name string) {
 	metrics.PagingPrechargeRU.DeleteLabelValues(name)
 	metrics.PagingSettlementRU.DeleteLabelValues(name)
 	metrics.PagingSettlementRUDelta.DeleteLabelValues(name)
+	for _, waitClass := range admissionWaitClasses {
+		metrics.PagingAdmissionTimeCounter.DeleteLabelValues(name, waitClass)
+		metrics.PagingAdmissionTimeRU.DeleteLabelValues(name, waitClass)
+		metrics.PagingAdmissionTimeBytes.DeleteLabelValues(name, waitClass)
+		metrics.FutureReservedCounter.DeleteLabelValues(name, waitClass)
+		metrics.FutureReservedRU.DeleteLabelValues(name, waitClass)
+		metrics.FutureReleasedCounter.DeleteLabelValues(name, waitClass)
+		metrics.FutureReleasedRU.DeleteLabelValues(name, waitClass)
+	}
+	metrics.FutureReleaseLag.DeleteLabelValues(name)
+	metrics.LimiterTokensGauge.DeleteLabelValues(name)
+	metrics.LimiterFutureReservationsGauge.DeleteLabelValues(name)
+	metrics.LimiterFutureReservedRUGauge.DeleteLabelValues(name)
+	metrics.LimiterFutureMaxWaitSecondsGauge.DeleteLabelValues(name)
 }
 
 // observePagingPrecharge requires bytesForEst > 0.
@@ -172,6 +188,16 @@ func (gmc *groupMetricsCollection) observePagingPrecharge(bytesForEst uint64, pr
 	gmc.prechargeCounter.Inc()
 	gmc.prechargeBytesCounter.Add(float64(bytesForEst))
 	gmc.prechargeRU.Add(prechargeRU)
+}
+
+func (gmc *groupMetricsCollection) observePagingAdmissionTime(name, waitClass string, bytesForEst uint64, prechargeRU float64, snap limiterDebugSnapshot) {
+	metrics.PagingAdmissionTimeCounter.WithLabelValues(name, waitClass).Inc()
+	metrics.PagingAdmissionTimeRU.WithLabelValues(name, waitClass).Add(prechargeRU)
+	metrics.PagingAdmissionTimeBytes.WithLabelValues(name, waitClass).Add(float64(bytesForEst))
+	metrics.LimiterTokensGauge.WithLabelValues(name).Set(snap.Tokens)
+	metrics.LimiterFutureReservationsGauge.WithLabelValues(name).Set(float64(snap.FutureCount))
+	metrics.LimiterFutureReservedRUGauge.WithLabelValues(name).Set(snap.FutureReservedRU)
+	metrics.LimiterFutureMaxWaitSecondsGauge.WithLabelValues(name).Set(snap.FutureMaxWait.Seconds())
 }
 
 // observePagingActual requires predicted > 0.
@@ -191,6 +217,23 @@ func (gmc *groupMetricsCollection) observePagingActual(predicted, actual uint64,
 func (gmc *groupMetricsCollection) observePagingNonprecharge(actual uint64) {
 	gmc.nonprechargeCounter.Inc()
 	gmc.nonprechargeActualBytes.Add(float64(actual))
+}
+
+func admissionWaitClass(d time.Duration) string {
+	switch {
+	case d <= 0:
+		return "0"
+	case d <= time.Second:
+		return "0_1s"
+	case d <= 5*time.Second:
+		return "1_5s"
+	case d <= 20*time.Second:
+		return "5_20s"
+	case d <= 60*time.Second:
+		return "20_60s"
+	default:
+		return "60s_plus"
+	}
 }
 
 type tokenCounter struct {
@@ -612,6 +655,66 @@ retryLoop:
 	return d, err
 }
 
+func (gc *groupCostController) observePagingAdmissionTime(info RequestInfo, delta *rmpb.Consumption, waitDuration time.Duration) {
+	bytesForEst := estimatedReadBytes(info)
+	if bytesForEst == 0 {
+		return
+	}
+	now := time.Now()
+	prechargeRU := getRUValueFromConsumption(delta)
+	waitClass := admissionWaitClass(waitDuration)
+	snap := gc.run.requestUnitTokens.limiter.debugSnapshot(now)
+	gc.metrics.observePagingAdmissionTime(gc.name, waitClass, bytesForEst, prechargeRU, snap)
+	if enableControllerTraceLog.Load() {
+		log.Info("rc_paging_admit",
+			zap.Int64("ts_unix_nano", now.UnixNano()),
+			zap.String("resource_group", gc.name),
+			zap.Uint64("store_id", info.StoreID()),
+			zap.Uint64("predicted_bytes", bytesForEst),
+			zap.Float64("precharge_ru", prechargeRU),
+			zap.Duration("wait", waitDuration),
+			zap.String("wait_class", waitClass),
+			zap.Float64("lim_tokens", snap.Tokens),
+			zap.Float64("lim_fill_rate", snap.FillRate),
+			zap.Int64("lim_burst", snap.Burst),
+			zap.Int("future_count", snap.FutureCount),
+			zap.Float64("future_reserved_ru", snap.FutureReservedRU),
+			zap.Duration("future_min_wait", snap.FutureMinWait),
+			zap.Duration("future_max_wait", snap.FutureMaxWait))
+	}
+}
+
+func (gc *groupCostController) logPagingSettlementDebug(req RequestInfo, resp ResponseInfo, count, delta *rmpb.Consumption, before, after limiterDebugSnapshot) {
+	bytesForEst := estimatedReadBytes(req)
+	if bytesForEst == 0 || !enableControllerTraceLog.Load() {
+		return
+	}
+	deltaRU := getRUValueFromConsumption(delta)
+	action := "none"
+	if deltaRU > 0 {
+		action = "remove"
+	} else if deltaRU < 0 {
+		action = "refund"
+	}
+	log.Info("rc_paging_settle",
+		zap.Int64("ts_unix_nano", time.Now().UnixNano()),
+		zap.String("resource_group", gc.name),
+		zap.Uint64("store_id", req.StoreID()),
+		zap.Uint64("predicted_bytes", bytesForEst),
+		zap.Uint64("actual_bytes", resp.ReadBytes()),
+		zap.Float64("settlement_ru", getRUValueFromConsumption(count)),
+		zap.Float64("settlement_delta_ru", deltaRU),
+		zap.String("settlement_action", action),
+		zap.Float64("lim_tokens_before", before.Tokens),
+		zap.Float64("lim_tokens_after", after.Tokens),
+		zap.Int("future_count_before", before.FutureCount),
+		zap.Int("future_count_after", after.FutureCount),
+		zap.Float64("future_reserved_ru_before", before.FutureReservedRU),
+		zap.Float64("future_reserved_ru_after", after.FutureReservedRU),
+		zap.Duration("future_max_wait_before", before.FutureMaxWait),
+		zap.Duration("future_max_wait_after", after.FutureMaxWait))
+}
+
 func (gc *groupCostController) onRequestWaitImpl(
 	ctx context.Context, info RequestInfo,
 ) (delta, penalty *rmpb.Consumption, waitDuration time.Duration, priority uint32, err error) {
@@ -641,6 +744,7 @@ func (gc *groupCostController) onRequestWaitImpl(
 	gc.mu.Lock()
 	add(gc.mu.consumption, delta)
 	gc.mu.Unlock()
+	gc.observePagingAdmissionTime(info, delta, waitDuration)
 
 	if bytesForEst := estimatedReadBytes(info); bytesForEst > 0 {
 		gc.metrics.observePagingPrecharge(bytesForEst, getRUValueFromConsumption(delta))
@@ -682,15 +786,20 @@ func (gc *groupCostController) onResponseImpl(
 	} else if !req.IsWrite() && req.IsCop() {
 		gc.metrics.observePagingNonprecharge(resp.ReadBytes())
 	}
+	var before, after limiterDebugSnapshot
 	if !gc.burstable.Load() {
 		counter := gc.run.requestUnitTokens
+		now := time.Now()
+		before = counter.limiter.debugSnapshot(now)
 		if v := getRUValueFromConsumption(delta); v > 0 {
-			counter.limiter.RemoveTokens(time.Now(), v)
+			counter.limiter.RemoveTokens(now, v)
 		} else if v < 0 {
 			// Paging over-estimate: refund the excess pre-charge.
-			counter.limiter.RefundTokens(time.Now(), -v)
+			counter.limiter.RefundTokens(now, -v)
 		}
+		after = counter.limiter.debugSnapshot(time.Now())
 	}
+	gc.logPagingSettlementDebug(req, resp, count, delta, before, after)
 
 	gc.mu.Lock()
 	add(gc.mu.consumption, delta)
@@ -720,9 +829,11 @@ func (gc *groupCostController) onResponseWaitImpl(
 	} else if !req.IsWrite() && req.IsCop() {
 		gc.metrics.observePagingNonprecharge(resp.ReadBytes())
 	}
+	var before, after limiterDebugSnapshot
 	var waitDuration time.Duration
 	if !gc.burstable.Load() {
 		v := getRUValueFromConsumption(delta)
+		before = gc.run.requestUnitTokens.limiter.debugSnapshot(time.Now())
 		if v > 0 {
 			allowDebt := delta.ReadBytes+delta.WriteBytes < bigRequestThreshold || !gc.isThrottled.Load()
 			d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt)
@@ -741,7 +852,9 @@ func (gc *groupCostController) onResponseWaitImpl(
 			// Paging over-estimate: refund the excess pre-charge.
 			gc.run.requestUnitTokens.limiter.RefundTokens(time.Now(), -v)
 		}
+		after = gc.run.requestUnitTokens.limiter.debugSnapshot(time.Now())
 	}
+	gc.logPagingSettlementDebug(req, resp, count, delta, before, after)
 
 	gc.mu.Lock()
 	add(gc.mu.consumption, delta)

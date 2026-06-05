@@ -111,6 +111,16 @@ type limiterMetricsCollection struct {
 	lowTokenNotifyCounter prometheus.Counter
 }
 
+type limiterDebugSnapshot struct {
+	Tokens           float64
+	FillRate         float64
+	Burst            int64
+	FutureCount      int
+	FutureReservedRU float64
+	FutureMinWait    time.Duration
+	FutureMaxWait    time.Duration
+}
+
 // NewLimiter returns a new Limiter that allows events up to rate r and permits
 // bursts of at most b tokens.
 func NewLimiter(now time.Time, r fillRate, b int64, tokens float64, lowTokensNotifyChan chan<- notifyMsg) *Limiter {
@@ -161,6 +171,10 @@ type Reservation struct {
 	updateCh        chan struct{}
 	inFutureQueue   bool
 	canceled        bool
+	reservedAt      time.Time
+	// originalTimeToAct keeps the first schedule for debug comparison. Reflow
+	// can move timeToAct, but it must not rewrite this field.
+	originalTimeToAct time.Time
 }
 
 var errReservationCanceled = errors.New("reservation canceled")
@@ -419,6 +433,7 @@ func (lim *Limiter) RemoveTokens(now time.Time, amount float64) {
 	lim.updateLast(now)
 	lim.tokens = tokens - amount
 	lim.reflowFutureReservationsLocked(now)
+	lim.observeDebugStateLocked(now, "remove", amount, 0)
 	lim.maybeNotify()
 }
 
@@ -444,6 +459,7 @@ func (lim *Limiter) RefundTokens(now time.Time, amount float64) {
 	lim.updateLast(now)
 	lim.tokens = tokens + amount
 	lim.reflowFutureReservationsLocked(now)
+	lim.observeDebugStateLocked(now, "refund", amount, 0)
 	// Mirror Reconfigure: refunded tokens may unblock acquireTokens retry waits.
 	if lim.reconfiguredCh != nil {
 		close(lim.reconfiguredCh)
@@ -546,6 +562,66 @@ func (lim *Limiter) cleanupFutureReservationsLocked(now time.Time) {
 	lim.futureReservations = survivors
 }
 
+func (lim *Limiter) debugSnapshot(now time.Time) limiterDebugSnapshot {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	return lim.debugSnapshotLocked(now)
+}
+
+func (lim *Limiter) debugSnapshotLocked(now time.Time) limiterDebugSnapshot {
+	_, tokens := lim.getTokens(now)
+	snap := limiterDebugSnapshot{
+		Tokens:   tokens,
+		FillRate: float64(lim.fillRate),
+		Burst:    lim.burst,
+	}
+	for _, reservation := range lim.futureReservations {
+		if reservation == nil || !reservation.inFutureQueue || reservation.canceled {
+			continue
+		}
+		snap.FutureCount++
+		snap.FutureReservedRU += reservation.tokens
+		wait := reservation.timeToAct.Sub(now)
+		if wait < 0 {
+			wait = 0
+		}
+		if snap.FutureMinWait == 0 || wait < snap.FutureMinWait {
+			snap.FutureMinWait = wait
+		}
+		if wait > snap.FutureMaxWait {
+			snap.FutureMaxWait = wait
+		}
+	}
+	return snap
+}
+
+func (lim *Limiter) observeDebugStateLocked(now time.Time, event string, amount float64, changedCount int) limiterDebugSnapshot {
+	snap := lim.debugSnapshotLocked(now)
+	if lim.name == "" {
+		return snap
+	}
+	metrics.LimiterTokensGauge.WithLabelValues(lim.name).Set(snap.Tokens)
+	metrics.LimiterFutureReservationsGauge.WithLabelValues(lim.name).Set(float64(snap.FutureCount))
+	metrics.LimiterFutureReservedRUGauge.WithLabelValues(lim.name).Set(snap.FutureReservedRU)
+	metrics.LimiterFutureMaxWaitSecondsGauge.WithLabelValues(lim.name).Set(snap.FutureMaxWait.Seconds())
+	if enableControllerTraceLog.Load() {
+		log.Info("rc_limiter_state",
+			zap.Int64("ts_unix_nano", now.UnixNano()),
+			zap.String("limiter", lim.name),
+			zap.String("event", event),
+			zap.Float64("amount_ru", amount),
+			zap.Float64("tokens", snap.Tokens),
+			zap.Float64("fill_rate", snap.FillRate),
+			zap.Int64("burst", snap.Burst),
+			zap.Int("future_count", snap.FutureCount),
+			zap.Float64("future_reserved_ru", snap.FutureReservedRU),
+			zap.Duration("future_min_wait", snap.FutureMinWait),
+			zap.Duration("future_max_wait", snap.FutureMaxWait),
+			zap.Int("changed_count", changedCount))
+	}
+	return snap
+}
+
 func (lim *Limiter) reflowFutureReservationsLocked(now time.Time) {
 	lim.cleanupFutureReservationsLocked(now)
 	if len(lim.futureReservations) == 0 {
@@ -559,6 +635,7 @@ func (lim *Limiter) reflowFutureReservationsLocked(now time.Time) {
 			if !reservation.timeToAct.Equal(now) {
 				reservation.timeToAct = now
 				reservation.signalStateChangedLocked()
+				lim.observeDebugStateLocked(now, "reflow", 0, 1)
 			}
 		}
 		return
@@ -581,6 +658,7 @@ func (lim *Limiter) reflowFutureReservationsLocked(now time.Time) {
 		if !reservation.timeToAct.Equal(newTimeToAct) {
 			reservation.timeToAct = newTimeToAct
 			reservation.signalStateChangedLocked()
+			lim.observeDebugStateLocked(now, "reflow", 0, 1)
 		}
 	}
 }
@@ -630,10 +708,12 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 		fillRate:         lim.fillRate,
 		needWaitDuration: waitDuration,
 		remainingTokens:  tokens,
+		reservedAt:       now,
 	}
 	if reserved {
 		r.tokens = n
 		r.timeToAct = now.Add(waitDuration)
+		r.originalTimeToAct = r.timeToAct
 		if waitDuration > 0 {
 			r.inFutureQueue = true
 			r.updateCh = make(chan struct{})
@@ -644,6 +724,27 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 	if reserved {
 		lim.updateLast(now)
 		lim.tokens = tokens
+		snap := lim.observeDebugStateLocked(now, "reserve", n, 0)
+		if waitDuration > 0 && lim.name != "" {
+			waitClass := admissionWaitClass(waitDuration)
+			metrics.FutureReservedCounter.WithLabelValues(lim.name, waitClass).Inc()
+			metrics.FutureReservedRU.WithLabelValues(lim.name, waitClass).Add(n)
+			if enableControllerTraceLog.Load() {
+				log.Info("rc_future_reserved",
+					zap.Int64("ts_unix_nano", now.UnixNano()),
+					zap.String("limiter", lim.name),
+					zap.Float64("request_ru", n),
+					zap.Float64("remaining_tokens", tokens),
+					zap.Float64("fill_rate", float64(lim.fillRate)),
+					zap.Int64("burst", lim.burst),
+					zap.Duration("wait", waitDuration),
+					zap.Int64("time_to_act_unix_nano", r.timeToAct.UnixNano()),
+					zap.Int("future_count", snap.FutureCount),
+					zap.Float64("future_reserved_ru", snap.FutureReservedRU),
+					zap.Duration("future_min_wait", snap.FutureMinWait),
+					zap.Duration("future_max_wait", snap.FutureMaxWait))
+			}
+		}
 		lim.maybeNotify()
 	} else {
 		// print log if the limiter cannot reserve for a while.
@@ -768,6 +869,39 @@ func WaitReservations(ctx context.Context, now time.Time, reservations []*Reserv
 			}
 		}
 		if longestDelayDuration <= 0 {
+			nowForRelease := logicalNow
+			for _, res := range reservations {
+				if res == nil || res.lim == nil || !res.inFutureQueue {
+					continue
+				}
+				res.lim.mu.Lock()
+				snap := res.lim.debugSnapshotLocked(nowForRelease)
+				if res.lim.name != "" {
+					actualWait := nowForRelease.Sub(res.reservedAt)
+					waitClass := admissionWaitClass(actualWait)
+					metrics.FutureReleasedCounter.WithLabelValues(res.lim.name, waitClass).Inc()
+					metrics.FutureReleasedRU.WithLabelValues(res.lim.name, waitClass).Add(res.tokens)
+					metrics.FutureReleaseLag.WithLabelValues(res.lim.name).Observe(nowForRelease.Sub(res.timeToAct).Seconds())
+					if enableControllerTraceLog.Load() {
+						log.Info("rc_future_released",
+							zap.Int64("ts_unix_nano", nowForRelease.UnixNano()),
+							zap.String("limiter", res.lim.name),
+							zap.Float64("request_ru", res.tokens),
+							zap.Int64("reserved_at_unix_nano", res.reservedAt.UnixNano()),
+							zap.Int64("original_time_to_act_unix_nano", res.originalTimeToAct.UnixNano()),
+							zap.Int64("current_time_to_act_unix_nano", res.timeToAct.UnixNano()),
+							zap.Duration("actual_wait", actualWait),
+							zap.Duration("scheduled_wait", res.timeToAct.Sub(res.reservedAt)),
+							zap.Duration("release_lag", nowForRelease.Sub(res.timeToAct)),
+							zap.Float64("lim_tokens", snap.Tokens),
+							zap.Float64("fill_rate", snap.FillRate),
+							zap.Int("future_count", snap.FutureCount),
+							zap.Float64("future_reserved_ru", snap.FutureReservedRU),
+							zap.Duration("future_max_wait", snap.FutureMaxWait))
+					}
+				}
+				res.lim.mu.Unlock()
+			}
 			release()
 			return waited, nil
 		}

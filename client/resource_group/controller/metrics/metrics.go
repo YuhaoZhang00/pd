@@ -86,6 +86,33 @@ var (
 	// PagingSettlementRUDelta records the distribution of per-RPC signed RU delta
 	// (settlement_ru - precharge_ru) for pre-charged coprocessor RPCs.
 	PagingSettlementRUDelta *prometheus.HistogramVec
+
+	// PagingAdmissionTimeCounter counts requests once they pass RC admission.
+	PagingAdmissionTimeCounter *prometheus.CounterVec
+	// PagingAdmissionTimeRU accumulates request precharge RU once the request passes RC admission.
+	PagingAdmissionTimeRU *prometheus.CounterVec
+	// PagingAdmissionTimeBytes accumulates predicted bytes once the request passes RC admission.
+	PagingAdmissionTimeBytes *prometheus.CounterVec
+
+	// FutureReservedCounter counts requests scheduled into a future reservation.
+	FutureReservedCounter *prometheus.CounterVec
+	// FutureReservedRU accumulates RU scheduled into future reservations.
+	FutureReservedRU *prometheus.CounterVec
+	// FutureReleasedCounter counts future reservations when they are released to execute.
+	FutureReleasedCounter *prometheus.CounterVec
+	// FutureReleasedRU accumulates RU released from future reservations.
+	FutureReleasedRU *prometheus.CounterVec
+	// FutureReleaseLag records now-current_time_to_act when a future reservation is released.
+	FutureReleaseLag *prometheus.HistogramVec
+
+	// LimiterTokensGauge records the local limiter token state.
+	LimiterTokensGauge *prometheus.GaugeVec
+	// LimiterFutureReservationsGauge records the number of queued future reservations.
+	LimiterFutureReservationsGauge *prometheus.GaugeVec
+	// LimiterFutureReservedRUGauge records queued future reservation RU.
+	LimiterFutureReservedRUGauge *prometheus.GaugeVec
+	// LimiterFutureMaxWaitSecondsGauge records the maximum queued future wait.
+	LimiterFutureMaxWaitSecondsGauge *prometheus.GaugeVec
 )
 
 func init() {
@@ -245,7 +272,7 @@ func initMetrics(constLabels prometheus.Labels) {
 			// prior observation (predicted=0) and workload shifts that
 			// leave the prediction above actual. Factor-4 spacing keeps
 			// resolution near zero.
-			Buckets: []float64{-67108864, -16777216, -4194304, -1048576, -262144, -65536, -16384, -4096, 0, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864},
+			Buckets:     []float64{-67108864, -16777216, -4194304, -1048576, -262144, -65536, -16384, -4096, 0, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864},
 			Help:        "Histogram of (actual_read_bytes - predicted_read_bytes) for pre-charged coprocessor RPCs. Shows predictor accuracy.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})
@@ -280,6 +307,106 @@ func initMetrics(constLabels prometheus.Labels) {
 			Help:        "Per-RPC signed settlement RU delta (settlement_ru - precharge_ru) for pre-charged coprocessor RPCs. Negative means refund, positive means extra debit.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})
+
+	PagingAdmissionTimeCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   requestSubsystem,
+			Name:        "admission_time_total",
+			Help:        "Counter of requests after they pass RC admission. The wait_class label is based on admission wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	PagingAdmissionTimeRU = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   requestSubsystem,
+			Name:        "admission_time_ru_total",
+			Help:        "Sum of request precharge RU after requests pass RC admission. The wait_class label is based on admission wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	PagingAdmissionTimeBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Subsystem:   requestSubsystem,
+			Name:        "admission_time_bytes_total",
+			Help:        "Sum of predicted bytes after requests pass RC admission. The wait_class label is based on admission wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReservedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserved_total",
+			Help:        "Counter of requests scheduled into future reservations. The wait_class label is based on the scheduled wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReservedRU = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserved_ru_total",
+			Help:        "Sum of RU scheduled into future reservations. The wait_class label is based on the scheduled wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReleasedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_released_total",
+			Help:        "Counter of future reservations released to execute. The wait_class label is based on actual wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReleasedRU = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_released_ru_total",
+			Help:        "Sum of RU released from future reservations. The wait_class label is based on actual wait duration.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReleaseLag = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace:   namespace,
+			Name:        "future_release_lag_seconds",
+			Buckets:     []float64{-1, -0.1, -0.01, 0, 0.01, 0.1, 1, 5, 10, 30, 60},
+			Help:        "Histogram of release_time - current_time_to_act for released future reservations.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel})
+
+	LimiterTokensGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_tokens",
+			Help:        "Local RC limiter token state.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel})
+
+	LimiterFutureReservationsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reservations",
+			Help:        "Number of queued future reservations in the local RC limiter.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel})
+
+	LimiterFutureReservedRUGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reserved_ru",
+			Help:        "Total queued RU in future reservations in the local RC limiter.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel})
+
+	LimiterFutureMaxWaitSecondsGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_max_wait_seconds",
+			Help:        "Maximum wait time among queued future reservations in the local RC limiter.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel})
 }
 
 // InitAndRegisterMetrics initializes and register metrics.
@@ -304,4 +431,16 @@ func InitAndRegisterMetrics(constLabels prometheus.Labels) {
 	prometheus.MustRegister(PagingPrechargeRU)
 	prometheus.MustRegister(PagingSettlementRU)
 	prometheus.MustRegister(PagingSettlementRUDelta)
+	prometheus.MustRegister(PagingAdmissionTimeCounter)
+	prometheus.MustRegister(PagingAdmissionTimeRU)
+	prometheus.MustRegister(PagingAdmissionTimeBytes)
+	prometheus.MustRegister(FutureReservedCounter)
+	prometheus.MustRegister(FutureReservedRU)
+	prometheus.MustRegister(FutureReleasedCounter)
+	prometheus.MustRegister(FutureReleasedRU)
+	prometheus.MustRegister(FutureReleaseLag)
+	prometheus.MustRegister(LimiterTokensGauge)
+	prometheus.MustRegister(LimiterFutureReservationsGauge)
+	prometheus.MustRegister(LimiterFutureReservedRUGauge)
+	prometheus.MustRegister(LimiterFutureMaxWaitSecondsGauge)
 }

@@ -425,6 +425,58 @@ func TestPagingPreChargeNoRefundWhenActualExceedsEstimate(t *testing.T) {
 		"when actual exceeds pre-charge, settlement should consume tokens")
 }
 
+func TestOnResponseWaitPositiveSettlementUsesResponsePhaseReservation(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+	gc.mainCfg.LTBMaxWaitDuration = 2 * time.Second
+
+	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		newTokens:   100000,
+		newFillRate: 100,
+		newBurst:    0,
+	})
+
+	predictedReadBytes := uint64(16 * 1024 * 1024)
+	actualReadBytes := predictedReadBytes + 640*1024 // 10 RU positive settlement delta.
+	req := &TestRequestInfo{
+		isWrite:            false,
+		isCop:              true,
+		predictedReadBytes: predictedReadBytes,
+	}
+	resp := &TestResponseInfo{
+		readBytes: actualReadBytes,
+		succeed:   true,
+	}
+
+	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+
+	available := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+	gc.run.requestUnitTokens.limiter.RemoveTokens(time.Now(), available+5)
+	gc.isThrottled.Store(true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := gc.onResponseWaitImpl(context.Background(), req, resp)
+		done <- err
+	}()
+
+	re.Eventually(func() bool {
+		lim := gc.run.requestUnitTokens.limiter
+		lim.mu.Lock()
+		defer lim.mu.Unlock()
+		for _, r := range lim.futureReservations {
+			if r == nil || !r.inFutureQueue || r.canceled {
+				continue
+			}
+			return r.phase == reservationPhaseResponseSettlement && r.tokens > 0 && r.tokens < 16
+		}
+		return false
+	}, time.Second, time.Millisecond)
+
+	re.NoError(<-done)
+}
+
 func TestOnResponseImplPagingRefund(t *testing.T) {
 	re := require.New(t)
 	gc := createTestGroupCostController(re)
@@ -716,7 +768,8 @@ func TestAcquireTokensSignalAwareWait(t *testing.T) {
 	resultCh := make(chan acquireResult, 1)
 	go func() {
 		var waitDuration time.Duration
-		_, err := gc.acquireTokens(context.Background(), delta, &waitDuration, false, nil)
+		_, err := gc.acquireTokens(context.Background(), delta, &waitDuration, false, nil,
+			reservationPhaseUnknown, 0, 0)
 		resultCh <- acquireResult{err, waitDuration}
 	}()
 
@@ -764,7 +817,8 @@ func TestAcquireTokensFallbackToTimer(t *testing.T) {
 	delta := &rmpb.Consumption{RRU: 5000}
 	ctx := context.Background()
 	var waitDuration time.Duration
-	_, err := gc.acquireTokens(ctx, delta, &waitDuration, false, nil)
+	_, err := gc.acquireTokens(ctx, delta, &waitDuration, false, nil,
+		reservationPhaseUnknown, 0, 0)
 
 	// Without a Reconfigure signal, all retries should exhaust and return an error.
 	re.Error(err)

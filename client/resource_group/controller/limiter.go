@@ -121,6 +121,24 @@ type limiterDebugSnapshot struct {
 	FutureMaxWait        time.Duration
 	FutureRUBucketCount  map[string]int
 	FutureRUBucketTokens map[string]float64
+	FuturePhaseCount     map[string]int
+	FuturePhaseTokens    map[string]float64
+	FuturePhaseBuckets   map[string]map[string]int
+	FuturePhaseBucketRU  map[string]map[string]float64
+}
+
+type reservationPhase string
+
+const (
+	reservationPhaseUnknown            reservationPhase = "unknown"
+	reservationPhaseRequestAdmission   reservationPhase = "request_admission"
+	reservationPhaseResponseSettlement reservationPhase = "response_settlement"
+)
+
+var reservationPhases = []reservationPhase{
+	reservationPhaseUnknown,
+	reservationPhaseRequestAdmission,
+	reservationPhaseResponseSettlement,
 }
 
 var futureRUBucketBounds = []struct {
@@ -186,6 +204,7 @@ type Reservation struct {
 	reserved         bool
 	lim              *Limiter
 	tokens           float64
+	phase            reservationPhase
 	timeToAct        time.Time
 	needWaitDuration time.Duration
 	// This is the fillRate at reservation time, it can change later.
@@ -356,6 +375,10 @@ func (r *Reservation) releaseFromFutureQueueLocked() {
 //
 // Use this method if you wish to wait and slow down in accordance with the rate limit without dropping events.
 func (lim *Limiter) Reserve(ctx context.Context, waitDuration time.Duration, now time.Time, n float64) *Reservation {
+	return lim.ReserveWithPhase(ctx, waitDuration, now, n, reservationPhaseUnknown)
+}
+
+func (lim *Limiter) ReserveWithPhase(ctx context.Context, waitDuration time.Duration, now time.Time, n float64, phase reservationPhase) *Reservation {
 	// Check if ctx is already cancelled
 	select {
 	case <-ctx.Done():
@@ -370,7 +393,7 @@ func (lim *Limiter) Reserve(ctx context.Context, waitDuration time.Duration, now
 	if deadline, ok := ctx.Deadline(); ok {
 		waitLimit = deadline.Sub(now)
 	}
-	return lim.reserveN(now, n, waitLimit)
+	return lim.reserveNWithPhase(now, n, waitLimit, phase)
 }
 
 // SetupNotificationThreshold enables the notification at the given threshold.
@@ -606,12 +629,28 @@ func (lim *Limiter) debugSnapshotLocked(now time.Time) limiterDebugSnapshot {
 		if snap.FutureRUBucketCount == nil {
 			snap.FutureRUBucketCount = make(map[string]int, len(futureRUBucketBounds))
 			snap.FutureRUBucketTokens = make(map[string]float64, len(futureRUBucketBounds))
+			snap.FuturePhaseCount = make(map[string]int, len(reservationPhases))
+			snap.FuturePhaseTokens = make(map[string]float64, len(reservationPhases))
+			snap.FuturePhaseBuckets = make(map[string]map[string]int, len(reservationPhases))
+			snap.FuturePhaseBucketRU = make(map[string]map[string]float64, len(reservationPhases))
 		}
 		snap.FutureCount++
 		snap.FutureReservedRU += reservation.tokens
 		bucket := futureRUBucket(reservation.tokens)
 		snap.FutureRUBucketCount[bucket]++
 		snap.FutureRUBucketTokens[bucket] += reservation.tokens
+		phase := string(reservation.phase)
+		if phase == "" {
+			phase = string(reservationPhaseUnknown)
+		}
+		snap.FuturePhaseCount[phase]++
+		snap.FuturePhaseTokens[phase] += reservation.tokens
+		if snap.FuturePhaseBuckets[phase] == nil {
+			snap.FuturePhaseBuckets[phase] = make(map[string]int, len(futureRUBucketBounds))
+			snap.FuturePhaseBucketRU[phase] = make(map[string]float64, len(futureRUBucketBounds))
+		}
+		snap.FuturePhaseBuckets[phase][bucket]++
+		snap.FuturePhaseBucketRU[phase][bucket] += reservation.tokens
 		wait := reservation.timeToAct.Sub(now)
 		if wait < 0 {
 			wait = 0
@@ -640,6 +679,19 @@ func (lim *Limiter) observeDebugStateLocked(now time.Time, event string, amount 
 			Set(float64(snap.FutureRUBucketCount[bucket.label]))
 		metrics.LimiterFutureReservedRUByBucketGauge.WithLabelValues(lim.name, bucket.label).
 			Set(snap.FutureRUBucketTokens[bucket.label])
+	}
+	for _, phase := range reservationPhases {
+		phaseLabel := string(phase)
+		metrics.LimiterFutureReservationsByPhaseGauge.WithLabelValues(lim.name, phaseLabel).
+			Set(float64(snap.FuturePhaseCount[phaseLabel]))
+		metrics.LimiterFutureReservedRUByPhaseGauge.WithLabelValues(lim.name, phaseLabel).
+			Set(snap.FuturePhaseTokens[phaseLabel])
+		for _, bucket := range futureRUBucketBounds {
+			metrics.LimiterFutureReservationsByPhaseRUBucketGauge.WithLabelValues(lim.name, phaseLabel, bucket.label).
+				Set(float64(snap.FuturePhaseBuckets[phaseLabel][bucket.label]))
+			metrics.LimiterFutureReservedRUByPhaseRUBucketGauge.WithLabelValues(lim.name, phaseLabel, bucket.label).
+				Set(snap.FuturePhaseBucketRU[phaseLabel][bucket.label])
+		}
 	}
 	if releaseObservabilityLogEnabled() {
 		log.Info("rc_limiter_state",
@@ -713,6 +765,10 @@ const reserveWarnLogInterval = 10 * time.Millisecond
 // reserveN is a helper method for Reserve.
 // maxFutureReserve specifies the maximum reservation wait duration allowed.
 func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Duration) *Reservation {
+	return lim.reserveNWithPhase(now, n, maxFutureReserve, reservationPhaseUnknown)
+}
+
+func (lim *Limiter) reserveNWithPhase(now time.Time, n float64, maxFutureReserve time.Duration, phase reservationPhase) *Reservation {
 	lim.mu.Lock()
 	defer lim.mu.Unlock()
 	lim.cleanupFutureReservationsLocked(now)
@@ -722,6 +778,7 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 			reserved:  true,
 			lim:       lim,
 			tokens:    n,
+			phase:     phase,
 			timeToAct: now,
 		}
 	}
@@ -742,6 +799,7 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 	r := &Reservation{
 		reserved:         reserved,
 		lim:              lim,
+		phase:            phase,
 		fillRate:         lim.fillRate,
 		needWaitDuration: waitDuration,
 		remainingTokens:  tokens,
@@ -766,10 +824,13 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 			waitClass := admissionWaitClass(waitDuration)
 			metrics.FutureReservedCounter.WithLabelValues(lim.name, waitClass).Inc()
 			metrics.FutureReservedRU.WithLabelValues(lim.name, waitClass).Add(n)
+			metrics.FutureReservedByPhaseCounter.WithLabelValues(lim.name, string(phase), waitClass).Inc()
+			metrics.FutureReservedRUByPhase.WithLabelValues(lim.name, string(phase), waitClass).Add(n)
 			if releaseObservabilityLogEnabled() {
 				log.Info("rc_future_reserved",
 					zap.Int64("ts_unix_nano", now.UnixNano()),
 					zap.String("limiter", lim.name),
+					zap.String("phase", string(phase)),
 					zap.Float64("request_ru", n),
 					zap.Float64("remaining_tokens", tokens),
 					zap.Float64("fill_rate", float64(lim.fillRate)),
@@ -788,11 +849,14 @@ func (lim *Limiter) reserveN(now time.Time, n float64, maxFutureReserve time.Dur
 			waitClass := admissionWaitClass(waitDuration)
 			metrics.FutureReserveFailedCounter.WithLabelValues(lim.name, waitClass).Inc()
 			metrics.FutureReserveFailedRU.WithLabelValues(lim.name, waitClass).Add(n)
+			metrics.FutureReserveFailedByPhaseCounter.WithLabelValues(lim.name, string(phase), waitClass).Inc()
+			metrics.FutureReserveFailedRUByPhase.WithLabelValues(lim.name, string(phase), waitClass).Add(n)
 			if releaseObservabilityLogEnabled() {
 				snap := lim.observeDebugStateLocked(now, "reserve_failed", n, 0)
 				log.Info("rc_future_reserve_failed",
 					zap.Int64("ts_unix_nano", now.UnixNano()),
 					zap.String("limiter", lim.name),
+					zap.String("phase", string(phase)),
 					zap.Float64("request_ru", n),
 					zap.Float64("remaining_tokens", tokens),
 					zap.Float64("fill_rate", float64(lim.fillRate)),

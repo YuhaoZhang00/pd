@@ -604,7 +604,16 @@ func (gc *groupCostController) calcRequest(counter *tokenCounter) float64 {
 	return value
 }
 
-func (gc *groupCostController) acquireTokens(ctx context.Context, delta *rmpb.Consumption, waitDuration *time.Duration, allowDebt bool, info RequestInfo) (time.Duration, error) {
+func (gc *groupCostController) acquireTokens(
+	ctx context.Context,
+	delta *rmpb.Consumption,
+	waitDuration *time.Duration,
+	allowDebt bool,
+	info RequestInfo,
+	phase reservationPhase,
+	actualBytes uint64,
+	settlementDeltaRU float64,
+) (time.Duration, error) {
 	gc.metrics.runningKVRequestCounter.Inc()
 	defer gc.metrics.runningKVRequestCounter.Dec()
 	var (
@@ -627,8 +636,8 @@ retryLoop:
 				counter.limiter.RemoveTokens(now, v)
 				break retryLoop
 			}
-			res = counter.limiter.Reserve(ctx, gc.mainCfg.LTBMaxWaitDuration, now, v)
-			gc.logFutureRequestDebug(info, res, v)
+			res = counter.limiter.ReserveWithPhase(ctx, gc.mainCfg.LTBMaxWaitDuration, now, v, phase)
+			gc.logFutureRequestDebug(info, res, v, phase, actualBytes, settlementDeltaRU, allowDebt)
 		}
 		if d, err = WaitReservations(ctx, now, []*Reservation{res}); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
 			break retryLoop
@@ -660,7 +669,15 @@ retryLoop:
 	return d, err
 }
 
-func (gc *groupCostController) logFutureRequestDebug(info RequestInfo, res *Reservation, requestRU float64) {
+func (gc *groupCostController) logFutureRequestDebug(
+	info RequestInfo,
+	res *Reservation,
+	requestRU float64,
+	phase reservationPhase,
+	actualBytes uint64,
+	settlementDeltaRU float64,
+	allowDebt bool,
+) {
 	if info == nil || res == nil || !releaseObservabilityLogEnabled() {
 		return
 	}
@@ -670,11 +687,16 @@ func (gc *groupCostController) logFutureRequestDebug(info RequestInfo, res *Rese
 	log.Info("rc_future_request",
 		zap.Int64("ts_unix_nano", time.Now().UnixNano()),
 		zap.String("resource_group", gc.name),
+		zap.String("phase", string(phase)),
 		zap.Uint64("store_id", info.StoreID()),
 		zap.Bool("is_cop", info.IsCop()),
 		zap.Bool("is_write", info.IsWrite()),
 		zap.Uint64("predicted_bytes", estimatedReadBytes(info)),
+		zap.Uint64("actual_bytes", actualBytes),
 		zap.Float64("request_ru", requestRU),
+		zap.Float64("settlement_delta_ru", settlementDeltaRU),
+		zap.Bool("allow_debt", allowDebt),
+		zap.Bool("is_throttled", gc.isThrottled.Load()),
 		zap.Bool("reserved", res.reserved),
 		zap.Duration("delay", res.needWaitDuration),
 		zap.Float64("remaining_tokens", res.remainingTokens))
@@ -749,7 +771,8 @@ func (gc *groupCostController) onRequestWaitImpl(
 	}
 
 	if !gc.burstable.Load() {
-		d, err := gc.acquireTokens(ctx, delta, &waitDuration, false, info)
+		d, err := gc.acquireTokens(ctx, delta, &waitDuration, false, info,
+			reservationPhaseRequestAdmission, 0, 0)
 		if err != nil {
 			if errs.ErrClientResourceGroupThrottled.Equal(err) {
 				gc.metrics.failedRequestCounterWithThrottled.Inc()
@@ -861,7 +884,8 @@ func (gc *groupCostController) onResponseWaitImpl(
 		before = gc.run.requestUnitTokens.limiter.debugSnapshot(time.Now())
 		if v > 0 {
 			allowDebt := delta.ReadBytes+delta.WriteBytes < bigRequestThreshold || !gc.isThrottled.Load()
-			d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt, req)
+			d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt, req,
+				reservationPhaseResponseSettlement, resp.ReadBytes(), v)
 			if err != nil {
 				if errs.ErrClientResourceGroupThrottled.Equal(err) {
 					gc.metrics.failedRequestCounterWithThrottled.Inc()

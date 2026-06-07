@@ -98,6 +98,12 @@ var (
 	FutureReservedCounter *prometheus.CounterVec
 	// FutureReservedRU accumulates RU scheduled into future reservations.
 	FutureReservedRU *prometheus.CounterVec
+	// FutureReservedByPhaseCounter counts future reservations split by
+	// request admission vs response settlement.
+	FutureReservedByPhaseCounter *prometheus.CounterVec
+	// FutureReservedRUByPhase accumulates future reservation RU split by
+	// request admission vs response settlement.
+	FutureReservedRUByPhase *prometheus.CounterVec
 	// FutureReleasedCounter counts future reservations when they are released to execute.
 	FutureReleasedCounter *prometheus.CounterVec
 	// FutureReleasedRU accumulates RU released from future reservations.
@@ -110,6 +116,10 @@ var (
 	// FutureReserveFailedRU accumulates RU from requests that could not be
 	// scheduled into a future reservation.
 	FutureReserveFailedRU *prometheus.CounterVec
+	// FutureReserveFailedByPhaseCounter counts reserve failures split by phase.
+	FutureReserveFailedByPhaseCounter *prometheus.CounterVec
+	// FutureReserveFailedRUByPhase accumulates reserve failure RU split by phase.
+	FutureReserveFailedRUByPhase *prometheus.CounterVec
 
 	// LimiterTokensGauge records the local limiter token state.
 	LimiterTokensGauge *prometheus.GaugeVec
@@ -125,6 +135,16 @@ var (
 	// LimiterFutureReservedRUByBucketGauge records queued reservation RU grouped
 	// by per-reservation RU.
 	LimiterFutureReservedRUByBucketGauge *prometheus.GaugeVec
+	// LimiterFutureReservationsByPhaseGauge records queued reservation count by phase.
+	LimiterFutureReservationsByPhaseGauge *prometheus.GaugeVec
+	// LimiterFutureReservedRUByPhaseGauge records queued reservation RU by phase.
+	LimiterFutureReservedRUByPhaseGauge *prometheus.GaugeVec
+	// LimiterFutureReservationsByPhaseRUBucketGauge records queued reservation
+	// count by phase and per-reservation RU bucket.
+	LimiterFutureReservationsByPhaseRUBucketGauge *prometheus.GaugeVec
+	// LimiterFutureReservedRUByPhaseRUBucketGauge records queued reservation RU
+	// by phase and per-reservation RU bucket.
+	LimiterFutureReservedRUByPhaseRUBucketGauge *prometheus.GaugeVec
 )
 
 func init() {
@@ -363,6 +383,22 @@ func initMetrics(constLabels prometheus.Labels) {
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel, "wait_class"})
 
+	FutureReservedByPhaseCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserved_by_phase_total",
+			Help:        "Counter of requests scheduled into future reservations split by admission phase. The phase label distinguishes request_admission from response_settlement.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "wait_class"})
+
+	FutureReservedRUByPhase = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserved_ru_by_phase_total",
+			Help:        "Sum of RU scheduled into future reservations split by admission phase. The phase label distinguishes request_admission from response_settlement.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "wait_class"})
+
 	FutureReleasedCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace:   namespace,
@@ -403,6 +439,22 @@ func initMetrics(constLabels prometheus.Labels) {
 			Help:        "Sum of RU for requests that could not be scheduled into future reservations. The wait_class label is based on required wait duration.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel, "wait_class"})
+
+	FutureReserveFailedByPhaseCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserve_failed_by_phase_total",
+			Help:        "Counter of requests that could not be scheduled into future reservations split by admission phase.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "wait_class"})
+
+	FutureReserveFailedRUByPhase = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   namespace,
+			Name:        "future_reserve_failed_ru_by_phase_total",
+			Help:        "Sum of RU for requests that could not be scheduled into future reservations split by admission phase.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "wait_class"})
 
 	LimiterTokensGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -451,6 +503,38 @@ func initMetrics(constLabels prometheus.Labels) {
 			Help:        "Total queued RU in future reservations grouped by per-reservation RU bucket.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel, "bucket"})
+
+	LimiterFutureReservationsByPhaseGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reservations_by_phase",
+			Help:        "Number of queued future reservations grouped by admission phase.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase"})
+
+	LimiterFutureReservedRUByPhaseGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reserved_ru_by_phase",
+			Help:        "Total queued RU in future reservations grouped by admission phase.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase"})
+
+	LimiterFutureReservationsByPhaseRUBucketGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reservations_by_phase_ru_bucket",
+			Help:        "Number of queued future reservations grouped by admission phase and per-reservation RU bucket.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "bucket"})
+
+	LimiterFutureReservedRUByPhaseRUBucketGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace:   namespace,
+			Name:        "limiter_future_reserved_ru_by_phase_ru_bucket",
+			Help:        "Total queued RU in future reservations grouped by admission phase and per-reservation RU bucket.",
+			ConstLabels: constLabels,
+		}, []string{newResourceGroupNameLabel, "phase", "bucket"})
 }
 
 // InitAndRegisterMetrics initializes and register metrics.
@@ -480,15 +564,23 @@ func InitAndRegisterMetrics(constLabels prometheus.Labels) {
 	prometheus.MustRegister(PagingAdmissionTimeBytes)
 	prometheus.MustRegister(FutureReservedCounter)
 	prometheus.MustRegister(FutureReservedRU)
+	prometheus.MustRegister(FutureReservedByPhaseCounter)
+	prometheus.MustRegister(FutureReservedRUByPhase)
 	prometheus.MustRegister(FutureReleasedCounter)
 	prometheus.MustRegister(FutureReleasedRU)
 	prometheus.MustRegister(FutureReleaseLag)
 	prometheus.MustRegister(FutureReserveFailedCounter)
 	prometheus.MustRegister(FutureReserveFailedRU)
+	prometheus.MustRegister(FutureReserveFailedByPhaseCounter)
+	prometheus.MustRegister(FutureReserveFailedRUByPhase)
 	prometheus.MustRegister(LimiterTokensGauge)
 	prometheus.MustRegister(LimiterFutureReservationsGauge)
 	prometheus.MustRegister(LimiterFutureReservedRUGauge)
 	prometheus.MustRegister(LimiterFutureMaxWaitSecondsGauge)
 	prometheus.MustRegister(LimiterFutureReservationsByRUBucketGauge)
 	prometheus.MustRegister(LimiterFutureReservedRUByBucketGauge)
+	prometheus.MustRegister(LimiterFutureReservationsByPhaseGauge)
+	prometheus.MustRegister(LimiterFutureReservedRUByPhaseGauge)
+	prometheus.MustRegister(LimiterFutureReservationsByPhaseRUBucketGauge)
+	prometheus.MustRegister(LimiterFutureReservedRUByPhaseRUBucketGauge)
 }

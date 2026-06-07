@@ -883,20 +883,28 @@ func (gc *groupCostController) onResponseWaitImpl(
 		v := getRUValueFromConsumption(delta)
 		before = gc.run.requestUnitTokens.limiter.debugSnapshot(time.Now())
 		if v > 0 {
-			allowDebt := delta.ReadBytes+delta.WriteBytes < bigRequestThreshold || !gc.isThrottled.Load()
-			d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt, req,
-				reservationPhaseResponseSettlement, resp.ReadBytes(), v)
-			if err != nil {
-				if errs.ErrClientResourceGroupThrottled.Equal(err) {
-					gc.metrics.failedRequestCounterWithThrottled.Inc()
-					gc.metrics.failedLimitReserveDuration.Observe(d.Seconds())
-				} else {
-					gc.metrics.failedRequestCounterWithOthers.Inc()
+			if estimatedReadBytes(req) > 0 {
+				// The precharged request has already consumed TiKV resources.
+				// Debit the residual RU immediately and reflow existing request-side
+				// reservations, but do not enqueue this response-side settlement as
+				// another future reservation.
+				gc.run.requestUnitTokens.limiter.RemoveTokens(time.Now(), v)
+			} else {
+				allowDebt := delta.ReadBytes+delta.WriteBytes < bigRequestThreshold || !gc.isThrottled.Load()
+				d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt, req,
+					reservationPhaseResponseSettlement, resp.ReadBytes(), v)
+				if err != nil {
+					if errs.ErrClientResourceGroupThrottled.Equal(err) {
+						gc.metrics.failedRequestCounterWithThrottled.Inc()
+						gc.metrics.failedLimitReserveDuration.Observe(d.Seconds())
+					} else {
+						gc.metrics.failedRequestCounterWithOthers.Inc()
+					}
+					return nil, waitDuration, err
 				}
-				return nil, waitDuration, err
+				gc.metrics.successfulRequestDuration.Observe(d.Seconds())
+				waitDuration += d
 			}
-			gc.metrics.successfulRequestDuration.Observe(d.Seconds())
-			waitDuration += d
 		} else if v < 0 {
 			// Paging over-estimate: refund the excess pre-charge.
 			gc.run.requestUnitTokens.limiter.RefundTokens(time.Now(), -v)

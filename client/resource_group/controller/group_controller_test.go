@@ -425,13 +425,13 @@ func TestPagingPreChargeNoRefundWhenActualExceedsEstimate(t *testing.T) {
 		"when actual exceeds pre-charge, settlement should consume tokens")
 }
 
-func TestOnResponseWaitPositiveSettlementUsesResponsePhaseReservation(t *testing.T) {
+func TestOnResponseWaitPrechargedPositiveSettlementDebitsWithoutReservation(t *testing.T) {
 	re := require.New(t)
 	gc := createTestGroupCostController(re)
 	gc.mainCfg.LTBMaxWaitDuration = 2 * time.Second
 
 	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
-		newTokens:   100000,
+		newTokens:   0,
 		newFillRate: 100,
 		newBurst:    0,
 	})
@@ -448,33 +448,38 @@ func TestOnResponseWaitPositiveSettlementUsesResponsePhaseReservation(t *testing
 		succeed:   true,
 	}
 
-	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
-	re.NoError(err)
-
-	available := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
-	gc.run.requestUnitTokens.limiter.RemoveTokens(time.Now(), available+5)
+	lim := gc.run.requestUnitTokens.limiter
+	available := lim.AvailableTokens(time.Now())
+	lim.RemoveTokens(time.Now(), available)
+	existing := lim.ReserveWithPhase(context.Background(), gc.mainCfg.LTBMaxWaitDuration,
+		time.Now(), 10, reservationPhaseRequestAdmission)
+	re.True(existing.reserved)
+	re.True(existing.inFutureQueue)
+	originalTimeToAct := existing.timeToAct
 	gc.isThrottled.Store(true)
 
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := gc.onResponseWaitImpl(context.Background(), req, resp)
-		done <- err
-	}()
+	tokensBefore := lim.AvailableTokens(time.Now())
+	_, waitDuration, err := gc.onResponseWaitImpl(context.Background(), req, resp)
+	re.NoError(err)
+	re.Zero(waitDuration)
+	tokensAfter := lim.AvailableTokens(time.Now())
+	re.Less(tokensAfter, tokensBefore)
 
-	re.Eventually(func() bool {
-		lim := gc.run.requestUnitTokens.limiter
-		lim.mu.Lock()
-		defer lim.mu.Unlock()
-		for _, r := range lim.futureReservations {
-			if r == nil || !r.inFutureQueue || r.canceled {
-				continue
-			}
-			return r.phase == reservationPhaseResponseSettlement && r.tokens > 0 && r.tokens < 16
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	responseReservations := 0
+	for _, r := range lim.futureReservations {
+		if r == nil || !r.inFutureQueue || r.canceled {
+			continue
 		}
-		return false
-	}, time.Second, time.Millisecond)
-
-	re.NoError(<-done)
+		if r.phase == reservationPhaseResponseSettlement {
+			responseReservations++
+		}
+	}
+	re.Equal(0, responseReservations)
+	re.True(existing.inFutureQueue)
+	re.True(existing.timeToAct.After(originalTimeToAct),
+		"positive settlement debt should reflow existing request-side reservations")
 }
 
 func TestOnResponseImplPagingRefund(t *testing.T) {

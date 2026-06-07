@@ -96,6 +96,7 @@ type Limiter struct {
 	// the future. Token state changes reflow these reservations so sleeping
 	// waiters do not keep stale schedules after Reconfigure/Remove/Refund/Cancel.
 	futureReservations []*Reservation
+	lastReflowSummary  reflowDebugSummary
 
 	// metrics
 	metrics *limiterMetricsCollection
@@ -125,6 +126,24 @@ type limiterDebugSnapshot struct {
 	FuturePhaseTokens    map[string]float64
 	FuturePhaseBuckets   map[string]map[string]int
 	FuturePhaseBucketRU  map[string]map[string]float64
+}
+
+type reflowDebugSummary struct {
+	Cause                  string
+	Amount                 float64
+	TokensBefore           float64
+	TokensAfter            float64
+	FutureCountBefore      int
+	FutureCountAfter       int
+	FutureReservedRUBefore float64
+	FutureReservedRUAfter  float64
+	FutureMaxWaitBefore    time.Duration
+	FutureMaxWaitAfter     time.Duration
+	ChangedCount           int
+	MovedLaterCount        int
+	MovedEarlierCount      int
+	MaxPush                time.Duration
+	MaxPull                time.Duration
 }
 
 type reservationPhase string
@@ -349,7 +368,7 @@ func (r *Reservation) CancelAt(now time.Time) {
 	// update state
 	r.lim.updateLast(now)
 	r.lim.tokens = tokens
-	r.lim.reflowFutureReservationsLocked(now)
+	r.lim.reflowFutureReservationsLocked(now, "cancel", r.tokens)
 }
 
 func (r *Reservation) releaseFromFutureQueueLocked() {
@@ -479,7 +498,7 @@ func (lim *Limiter) RemoveTokens(now time.Time, amount float64) {
 	_, tokens := lim.getTokens(now)
 	lim.updateLast(now)
 	lim.tokens = tokens - amount
-	lim.reflowFutureReservationsLocked(now)
+	lim.reflowFutureReservationsLocked(now, "remove", amount)
 	lim.observeDebugStateLocked(now, "remove", amount, 0)
 	lim.maybeNotify()
 }
@@ -505,7 +524,7 @@ func (lim *Limiter) RefundTokens(now time.Time, amount float64) {
 	_, tokens := lim.getTokens(now)
 	lim.updateLast(now)
 	lim.tokens = tokens + amount
-	lim.reflowFutureReservationsLocked(now)
+	lim.reflowFutureReservationsLocked(now, "refund", amount)
 	lim.observeDebugStateLocked(now, "refund", amount, 0)
 	// Mirror Reconfigure: refunded tokens may unblock acquireTokens retry waits.
 	if lim.reconfiguredCh != nil {
@@ -556,7 +575,7 @@ func (lim *Limiter) Reconfigure(now time.Time,
 	for _, opt := range opts {
 		opt(lim)
 	}
-	lim.reflowFutureReservationsLocked(now)
+	lim.reflowFutureReservationsLocked(now, "reconfigure", args.newTokens)
 	lim.maybeNotify()
 	// Wake up all goroutines waiting in acquireTokens retry loops.
 	if lim.reconfiguredCh != nil {
@@ -711,22 +730,42 @@ func (lim *Limiter) observeDebugStateLocked(now time.Time, event string, amount 
 	return snap
 }
 
-func (lim *Limiter) reflowFutureReservationsLocked(now time.Time) {
+func (lim *Limiter) reflowFutureReservationsLocked(now time.Time, cause string, amount float64) {
 	lim.cleanupFutureReservationsLocked(now)
 	if len(lim.futureReservations) == 0 {
 		return
 	}
+	before := lim.debugSnapshotLocked(now)
+	changedCount := 0
+	movedLaterCount := 0
+	movedEarlierCount := 0
+	var maxPush, maxPull time.Duration
 	if lim.burst < 0 || lim.fillRate == Inf {
 		for _, reservation := range lim.futureReservations {
 			if reservation == nil || !reservation.inFutureQueue || reservation.canceled {
 				continue
 			}
 			if !reservation.timeToAct.Equal(now) {
+				delta := now.Sub(reservation.timeToAct)
+				if delta > 0 {
+					movedLaterCount++
+					if delta > maxPush {
+						maxPush = delta
+					}
+				} else if delta < 0 {
+					pull := -delta
+					movedEarlierCount++
+					if pull > maxPull {
+						maxPull = pull
+					}
+				}
 				reservation.timeToAct = now
 				reservation.signalStateChangedLocked()
-				lim.observeDebugStateLocked(now, "reflow", 0, 1)
+				changedCount++
 			}
 		}
+		lim.recordReflowSummaryLocked(now, cause, amount, before, changedCount, movedLaterCount,
+			movedEarlierCount, maxPush, maxPull)
 		return
 	}
 	available := lim.tokens
@@ -745,11 +784,80 @@ func (lim *Limiter) reflowFutureReservationsLocked(now time.Time) {
 			newTimeToAct = now.Add(lim.fillRate.durationFromTokens(-available))
 		}
 		if !reservation.timeToAct.Equal(newTimeToAct) {
+			delta := newTimeToAct.Sub(reservation.timeToAct)
+			if delta > 0 {
+				movedLaterCount++
+				if delta > maxPush {
+					maxPush = delta
+				}
+			} else if delta < 0 {
+				pull := -delta
+				movedEarlierCount++
+				if pull > maxPull {
+					maxPull = pull
+				}
+			}
 			reservation.timeToAct = newTimeToAct
 			reservation.signalStateChangedLocked()
-			lim.observeDebugStateLocked(now, "reflow", 0, 1)
+			changedCount++
 		}
 	}
+	lim.recordReflowSummaryLocked(now, cause, amount, before, changedCount, movedLaterCount,
+		movedEarlierCount, maxPush, maxPull)
+}
+
+func (lim *Limiter) recordReflowSummaryLocked(
+	now time.Time,
+	cause string,
+	amount float64,
+	before limiterDebugSnapshot,
+	changedCount int,
+	movedLaterCount int,
+	movedEarlierCount int,
+	maxPush time.Duration,
+	maxPull time.Duration,
+) {
+	after := lim.debugSnapshotLocked(now)
+	summary := reflowDebugSummary{
+		Cause:                  cause,
+		Amount:                 amount,
+		TokensBefore:           before.Tokens,
+		TokensAfter:            after.Tokens,
+		FutureCountBefore:      before.FutureCount,
+		FutureCountAfter:       after.FutureCount,
+		FutureReservedRUBefore: before.FutureReservedRU,
+		FutureReservedRUAfter:  after.FutureReservedRU,
+		FutureMaxWaitBefore:    before.FutureMaxWait,
+		FutureMaxWaitAfter:     after.FutureMaxWait,
+		ChangedCount:           changedCount,
+		MovedLaterCount:        movedLaterCount,
+		MovedEarlierCount:      movedEarlierCount,
+		MaxPush:                maxPush,
+		MaxPull:                maxPull,
+	}
+	lim.lastReflowSummary = summary
+	if lim.name == "" || !releaseObservabilityLogEnabled() {
+		return
+	}
+	log.Info("rc_reflow_summary",
+		zap.Int64("ts_unix_nano", now.UnixNano()),
+		zap.String("limiter", lim.name),
+		zap.String("cause", cause),
+		zap.Float64("amount_ru", amount),
+		zap.Float64("tokens_before", summary.TokensBefore),
+		zap.Float64("tokens_after", summary.TokensAfter),
+		zap.Int("future_count_before", summary.FutureCountBefore),
+		zap.Int("future_count_after", summary.FutureCountAfter),
+		zap.Float64("future_reserved_ru_before", summary.FutureReservedRUBefore),
+		zap.Float64("future_reserved_ru_after", summary.FutureReservedRUAfter),
+		zap.Duration("future_max_wait_before", summary.FutureMaxWaitBefore),
+		zap.Duration("future_max_wait_after", summary.FutureMaxWaitAfter),
+		zap.Duration("future_max_wait_delta", summary.FutureMaxWaitAfter-summary.FutureMaxWaitBefore),
+		zap.Int("changed_count", changedCount),
+		zap.Int("moved_later_count", movedLaterCount),
+		zap.Int("moved_earlier_count", movedEarlierCount),
+		zap.Duration("max_push", maxPush),
+		zap.Duration("max_pull", maxPull))
 }
 
 func (lim *Limiter) updateLast(t time.Time) {

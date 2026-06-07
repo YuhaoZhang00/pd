@@ -637,7 +637,8 @@ retryLoop:
 				break retryLoop
 			}
 			res = counter.limiter.ReserveWithPhase(ctx, gc.mainCfg.LTBMaxWaitDuration, now, v, phase)
-			gc.logFutureRequestDebug(info, res, v, phase, actualBytes, settlementDeltaRU, allowDebt)
+			gc.logFutureRequestDebug(info, res, v, phase, actualBytes, settlementDeltaRU, allowDebt,
+				gc.mainCfg.LTBMaxWaitDuration)
 		}
 		if d, err = WaitReservations(ctx, now, []*Reservation{res}); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
 			break retryLoop
@@ -677,6 +678,7 @@ func (gc *groupCostController) logFutureRequestDebug(
 	actualBytes uint64,
 	settlementDeltaRU float64,
 	allowDebt bool,
+	maxWait time.Duration,
 ) {
 	if info == nil || res == nil || !releaseObservabilityLogEnabled() {
 		return
@@ -699,6 +701,7 @@ func (gc *groupCostController) logFutureRequestDebug(
 		zap.Bool("is_throttled", gc.isThrottled.Load()),
 		zap.Bool("reserved", res.reserved),
 		zap.Duration("delay", res.needWaitDuration),
+		zap.Duration("max_wait", maxWait),
 		zap.Float64("remaining_tokens", res.remainingTokens))
 }
 
@@ -729,6 +732,35 @@ func (gc *groupCostController) observePagingAdmissionTime(info RequestInfo, delt
 			zap.Duration("future_min_wait", snap.FutureMinWait),
 			zap.Duration("future_max_wait", snap.FutureMaxWait))
 	}
+}
+
+func (gc *groupCostController) logSettlementDebitDebug(
+	req RequestInfo,
+	resp ResponseInfo,
+	settlementDeltaRU float64,
+	before limiterDebugSnapshot,
+	after limiterDebugSnapshot,
+) {
+	bytesForEst := estimatedReadBytes(req)
+	if bytesForEst == 0 || !releaseObservabilityLogEnabled() {
+		return
+	}
+	log.Info("rc_settlement_debit",
+		zap.Int64("ts_unix_nano", time.Now().UnixNano()),
+		zap.String("resource_group", gc.name),
+		zap.Uint64("store_id", req.StoreID()),
+		zap.Uint64("predicted_bytes", bytesForEst),
+		zap.Uint64("actual_bytes", resp.ReadBytes()),
+		zap.Float64("settlement_delta_ru", settlementDeltaRU),
+		zap.Float64("lim_tokens_before", before.Tokens),
+		zap.Float64("lim_tokens_after", after.Tokens),
+		zap.Int("future_count_before", before.FutureCount),
+		zap.Int("future_count_after", after.FutureCount),
+		zap.Float64("future_reserved_ru_before", before.FutureReservedRU),
+		zap.Float64("future_reserved_ru_after", after.FutureReservedRU),
+		zap.Duration("future_max_wait_before", before.FutureMaxWait),
+		zap.Duration("future_max_wait_after", after.FutureMaxWait),
+		zap.Duration("future_max_wait_delta", after.FutureMaxWait-before.FutureMaxWait))
 }
 
 func (gc *groupCostController) logPagingSettlementDebug(req RequestInfo, resp ResponseInfo, count, delta *rmpb.Consumption, before, after limiterDebugSnapshot) {
@@ -838,14 +870,18 @@ func (gc *groupCostController) onResponseImpl(
 	if !gc.burstable.Load() {
 		counter := gc.run.requestUnitTokens
 		now := time.Now()
+		v := getRUValueFromConsumption(delta)
 		before = counter.limiter.debugSnapshot(now)
-		if v := getRUValueFromConsumption(delta); v > 0 {
+		if v > 0 {
 			counter.limiter.RemoveTokens(now, v)
 		} else if v < 0 {
 			// Paging over-estimate: refund the excess pre-charge.
 			counter.limiter.RefundTokens(now, -v)
 		}
 		after = counter.limiter.debugSnapshot(time.Now())
+		if v > 0 && estimatedReadBytes(req) > 0 {
+			gc.logSettlementDebitDebug(req, resp, v, before, after)
+		}
 	}
 	gc.logPagingSettlementDebug(req, resp, count, delta, before, after)
 
@@ -910,6 +946,9 @@ func (gc *groupCostController) onResponseWaitImpl(
 			gc.run.requestUnitTokens.limiter.RefundTokens(time.Now(), -v)
 		}
 		after = gc.run.requestUnitTokens.limiter.debugSnapshot(time.Now())
+		if v > 0 && estimatedReadBytes(req) > 0 {
+			gc.logSettlementDebitDebug(req, resp, v, before, after)
+		}
 	}
 	gc.logPagingSettlementDebug(req, resp, count, delta, before, after)
 

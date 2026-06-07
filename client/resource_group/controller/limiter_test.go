@@ -645,6 +645,30 @@ func TestRefundTokensReflowsFutureReservations(t *testing.T) {
 		"new reservations must not slip ahead of old sleepers after RefundTokens")
 }
 
+func TestRemoveTokensReflowSummaryCapturesMaxWaitPush(t *testing.T) {
+	re := require.New(t)
+	resetTime()
+	lim := NewLimiter(t0, 100, 0, 0, make(chan notifyMsg, 1))
+	ctx := context.Background()
+
+	for range 3 {
+		reservation := lim.Reserve(ctx, 30*time.Second, t0, 1000)
+		re.True(reservation.reserved)
+	}
+
+	lim.RemoveTokens(t1, 1000)
+
+	summary := lim.lastReflowSummary
+	re.Equal("remove", summary.Cause)
+	re.Equal(1000.0, summary.Amount)
+	re.Equal(3, summary.ChangedCount)
+	re.Equal(3, summary.MovedLaterCount)
+	re.Equal(0, summary.MovedEarlierCount)
+	re.Equal(29*time.Second, summary.FutureMaxWaitBefore)
+	re.Equal(39*time.Second, summary.FutureMaxWaitAfter)
+	re.Equal(10*time.Second, summary.MaxPush)
+}
+
 func TestRefundTokensWakesFutureReservationWaiter(t *testing.T) {
 	re := require.New(t)
 	now := time.Now()

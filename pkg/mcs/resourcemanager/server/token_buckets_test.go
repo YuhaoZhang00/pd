@@ -358,6 +358,7 @@ func TestGroupTokenBucketSlotEventCounters(t *testing.T) {
 	gtb.request(now, 1000, uint64(time.Second)*10/uint64(time.Millisecond), clientUniqueID)
 	re.Equal(uint64(2), gtb.slotsCreated)
 	gtb.tokenSlots[clientUniqueID].lastReqTime = now.Add(-(slotExpireTimeout + time.Second))
+	gtb.nextSlotExpireTime = now.Add(-time.Second)
 	gtb.request(now.Add(2*time.Second), 1000, uint64(time.Second)*10/uint64(time.Millisecond), clientUniqueID+1)
 	re.Equal(uint64(1), gtb.slotsExpired)
 }
@@ -392,6 +393,7 @@ func TestGroupTokenBucketTokenLoanMetricIsMaintainedIncrementally(t *testing.T) 
 	assertCachedLoan()
 
 	gtb.tokenSlots[2].lastReqTime = time.Now().Add(-(slotExpireTimeout + time.Second))
+	gtb.nextSlotExpireTime = now.Add(-time.Second)
 	_, _ = gtb.request(now, 100, targetPeriodMs, 3)
 	assertCachedLoan()
 
@@ -399,6 +401,43 @@ func TestGroupTokenBucketTokenLoanMetricIsMaintainedIncrementally(t *testing.T) 
 	gtb.overrideBurstLimit = 0
 	_, _ = gtb.request(now, 100, targetPeriodMs, 3)
 	assertCachedLoan()
+}
+
+func TestGroupTokenBucketCleanupExpiredSlotsUsesNextExpireHint(t *testing.T) {
+	re := require.New(t)
+	gtb := NewGroupTokenBucket(testResourceGroupName, &rmpb.TokenBucket{
+		Settings: &rmpb.TokenLimitSettings{
+			FillRate:   10,
+			BurstLimit: 100,
+		},
+	})
+	now := time.Now()
+	firstSlot := newTokenSlot(1, now)
+	secondSlot := newTokenSlot(2, now.Add(time.Minute))
+	gtb.tokenSlots[1] = firstSlot
+	gtb.tokenSlots[2] = secondSlot
+	gtb.updateNextSlotExpireTime(firstSlot)
+	gtb.updateNextSlotExpireTime(secondSlot)
+
+	expiredSlots := gtb.cleanupExpiredSlots(now.Add(time.Minute))
+	re.Empty(expiredSlots)
+	re.Contains(gtb.tokenSlots, uint64(1))
+	re.Contains(gtb.tokenSlots, uint64(2))
+	re.Equal(firstSlot.lastReqTime.Add(slotExpireTimeout), gtb.nextSlotExpireTime)
+
+	expiredSlots = gtb.cleanupExpiredSlots(firstSlot.lastReqTime.Add(slotExpireTimeout))
+	re.Len(expiredSlots, 1)
+	re.Equal(uint64(1), expiredSlots[0].clientUniqueID)
+	re.NotContains(gtb.tokenSlots, uint64(1))
+	re.Contains(gtb.tokenSlots, uint64(2))
+	re.Equal(secondSlot.lastReqTime.Add(slotExpireTimeout), gtb.nextSlotExpireTime)
+
+	secondSlot.lastReqTime = now.Add(2 * time.Minute)
+	gtb.nextSlotExpireTime = now.Add(-time.Second)
+	expiredSlots = gtb.cleanupExpiredSlots(now)
+	re.Empty(expiredSlots)
+	re.Contains(gtb.tokenSlots, uint64(2))
+	re.Equal(secondSlot.lastReqTime.Add(slotExpireTimeout), gtb.nextSlotExpireTime)
 }
 
 func TestGroupTokenBucketCloneDoesNotShareTokenSlots(t *testing.T) {

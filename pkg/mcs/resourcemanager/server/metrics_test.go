@@ -970,6 +970,9 @@ func TestGaugeMetricsSetGroupSlotMetrics(t *testing.T) {
 	re := require.New(t)
 	groupName := "slot_group"
 	keyspaceName := "slot_keyspace"
+	t.Cleanup(func() {
+		deleteDefaultLabelValuesForTest(keyspaceName, groupName)
+	})
 	rg := &ResourceGroup{
 		Name: groupName,
 		Mode: rmpb.GroupMode_RUMode,
@@ -999,6 +1002,89 @@ func TestGaugeMetricsSetGroupSlotMetrics(t *testing.T) {
 	re.Zero(created)
 	re.Zero(deleted)
 	re.Zero(expired)
+}
+
+func TestGaugeMetricsSetGroupCleansExpiredSlots(t *testing.T) {
+	re := require.New(t)
+	groupName := "expired_slot_group"
+	keyspaceName := "expired_slot_keyspace"
+	t.Cleanup(func() {
+		deleteDefaultLabelValuesForTest(keyspaceName, groupName)
+	})
+	rg := &ResourceGroup{
+		Name: groupName,
+		Mode: rmpb.GroupMode_RUMode,
+		RUSettings: NewRequestUnitSettings(groupName, &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		}),
+	}
+	now := time.Now()
+	expiredSlot := newTokenSlot(1, now.Add(-slotExpireTimeout-time.Second))
+	activeSlot := newTokenSlot(2, now)
+	rg.RUSettings.RU.tokenSlots[1] = expiredSlot
+	rg.RUSettings.RU.tokenSlots[2] = activeSlot
+	rg.RUSettings.RU.setSlotTokenCapacity(expiredSlot, -12.5)
+	rg.RUSettings.RU.setSlotTokenCapacity(activeSlot, -7.5)
+	rg.RUSettings.RU.slotsExpired = 3
+
+	gm := newGaugeMetrics(keyspaceName, groupName)
+	gm.setGroup(rg, keyspaceName)
+
+	re.Equal(1.0, testutil.ToFloat64(gm.activeSlotCountGauge))
+	re.Equal(7.5, testutil.ToFloat64(gm.tokenLoanGauge))
+	re.Equal(4.0, testutil.ToFloat64(gm.slotExpiredCounter))
+	re.NotContains(rg.RUSettings.RU.tokenSlots, uint64(1))
+	re.Contains(rg.RUSettings.RU.tokenSlots, uint64(2))
+	created, deleted, expired := rg.DrainSlotEvents()
+	re.Zero(created)
+	re.Zero(deleted)
+	re.Zero(expired)
+
+	gm.setGroup(rg, keyspaceName)
+	re.Equal(1.0, testutil.ToFloat64(gm.activeSlotCountGauge))
+	re.Equal(7.5, testutil.ToFloat64(gm.tokenLoanGauge))
+	re.Equal(4.0, testutil.ToFloat64(gm.slotExpiredCounter))
+}
+
+func TestRefreshSlotMetricsExpiresNaturallyCreatedSlots(t *testing.T) {
+	re := require.New(t)
+	groupName := "natural_expired_slot_group"
+	keyspaceName := "natural_expired_slot_keyspace"
+	t.Cleanup(func() {
+		deleteRequestMetricLabelValues(keyspaceName, groupName)
+	})
+	rg := &ResourceGroup{
+		Name: groupName,
+		Mode: rmpb.GroupMode_RUMode,
+		RUSettings: NewRequestUnitSettings(groupName, &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		}),
+	}
+	start := time.Now()
+	targetPeriodMs := uint64(time.Second / time.Millisecond)
+	requestMetrics := newRequestMetrics(keyspaceName, groupName)
+	serviceLimiter := newServiceLimiter(0, 0, nil)
+
+	re.NotNil(rg.RequestRU(start, 10, targetPeriodMs, 1, keyspaceName, nil, serviceLimiter, requestMetrics))
+	re.NotNil(rg.RequestRU(start, 10, targetPeriodMs, 2, keyspaceName, nil, serviceLimiter, requestMetrics))
+	refreshedAt := start.Add(slotExpireTimeout / 2)
+	re.NotNil(rg.RequestRU(refreshedAt, 10, targetPeriodMs, 2, keyspaceName, nil, serviceLimiter, requestMetrics))
+
+	slotMetrics, slotEvents := rg.RefreshSlotMetrics(start.Add(slotExpireTimeout + time.Second))
+
+	re.Equal(1, slotMetrics.SlotCount)
+	re.Contains(rg.RUSettings.RU.tokenSlots, uint64(2))
+	re.NotContains(rg.RUSettings.RU.tokenSlots, uint64(1))
+	re.Equal(rg.RUSettings.RU.tokenSlots[2].lastReqTime.Add(slotExpireTimeout), rg.RUSettings.RU.nextSlotExpireTime)
+	re.Equal(uint64(2), slotEvents.Created)
+	re.Zero(slotEvents.Deleted)
+	re.Equal(uint64(1), slotEvents.Expired)
 }
 
 func deleteDefaultLabelValuesForTest(keyspaceName, groupName string) {

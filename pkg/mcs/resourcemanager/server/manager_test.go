@@ -593,6 +593,71 @@ func TestFlushResourceGroupMetricsDrainsLiveSlotEvents(t *testing.T) {
 	re.Equal(3.0, promtestutil.ToFloat64(gm.slotExpiredCounter))
 }
 
+func TestFlushResourceGroupMetricsCleansExpiredSlots(t *testing.T) {
+	re := require.New(t)
+	const (
+		keyspaceID   = uint32(10868)
+		keyspaceName = "expired_slot_metrics_keyspace"
+		groupName    = "expired_slot_metrics_group"
+	)
+
+	m := prepareManager()
+	m.updateKeyspaceNameLookup(keyspaceID, keyspaceName)
+	t.Cleanup(func() {
+		m.metrics.cleanupAllMetrics(consumptionRecordKey{
+			keyspaceID: keyspaceID,
+			groupName:  groupName,
+			ruType:     defaultTypeLabel,
+		}, keyspaceName)
+	})
+
+	krgm := newKeyspaceResourceGroupManager(keyspaceID, m.storage)
+	rg := &ResourceGroup{
+		Name: groupName,
+		Mode: rmpb.GroupMode_RUMode,
+		RUSettings: NewRequestUnitSettings(groupName, &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		}),
+	}
+	now := time.Now()
+	expiredSlot := newTokenSlot(1, now.Add(-slotExpireTimeout-time.Second))
+	activeSlot := newTokenSlot(2, now)
+	rg.RUSettings.RU.tokenSlots[1] = expiredSlot
+	rg.RUSettings.RU.tokenSlots[2] = activeSlot
+	rg.RUSettings.RU.setSlotTokenCapacity(expiredSlot, -12.5)
+	rg.RUSettings.RU.setSlotTokenCapacity(activeSlot, -7.5)
+	rg.RUSettings.RU.slotsExpired = 3
+	krgm.groups[groupName] = rg
+
+	gm := m.metrics.getGaugeMetrics(keyspaceID, keyspaceName, groupName)
+	m.flushResourceGroupMetrics(context.Background(), krgm)
+
+	re.Equal(1.0, promtestutil.ToFloat64(gm.activeSlotCountGauge))
+	re.Equal(7.5, promtestutil.ToFloat64(gm.tokenLoanGauge))
+	re.Equal(4.0, promtestutil.ToFloat64(gm.slotExpiredCounter))
+	re.NotContains(rg.RUSettings.RU.tokenSlots, uint64(1))
+	re.Contains(rg.RUSettings.RU.tokenSlots, uint64(2))
+
+	requestMetrics := m.metrics.getRequestMetrics(keyspaceID, keyspaceName, groupName, now)
+	tokens := rg.RequestRU(
+		now.Add(time.Second),
+		10,
+		uint64(time.Second/time.Millisecond),
+		1,
+		keyspaceName,
+		nil,
+		newServiceLimiter(keyspaceID, 0, nil),
+		requestMetrics,
+	)
+	re.NotNil(tokens)
+	re.Contains(rg.RUSettings.RU.tokenSlots, uint64(1))
+	re.Contains(rg.RUSettings.RU.tokenSlots, uint64(2))
+	re.InDelta(scanTokenLoan(rg.RUSettings.RU), rg.RUSettings.RU.getTokenLoan(), 1e-7)
+}
+
 func TestKeyspaceServiceLimit(t *testing.T) {
 	re := require.New(t)
 

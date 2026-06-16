@@ -203,6 +203,9 @@ type GroupTokenBucketState struct {
 	// Cached token loan for metrics reporting. It is derived from tokenSlots and
 	// should not be used by token allocation logic.
 	tokenLoan float64
+	// nextSlotExpireTime is a cleanup hint. It may be earlier than the actual
+	// earliest expiration time, but it must not be later.
+	nextSlotExpireTime time.Time
 }
 
 func (gts *GroupTokenBucketState) clone() *GroupTokenBucketState {
@@ -232,6 +235,7 @@ func (gts *GroupTokenBucketState) clone() *GroupTokenBucketState {
 		slotsDeleted:       gts.slotsDeleted,
 		slotsExpired:       gts.slotsExpired,
 		tokenLoan:          gts.tokenLoan,
+		nextSlotExpireTime: gts.nextSlotExpireTime,
 	}
 }
 
@@ -271,6 +275,9 @@ func (gts *GroupTokenBucketState) removeTokenSlot(clientUniqueID uint64) bool {
 		gts.tokenLoan = 0
 	}
 	delete(gts.tokenSlots, clientUniqueID)
+	if len(gts.tokenSlots) == 0 {
+		gts.nextSlotExpireTime = time.Time{}
+	}
 	return true
 }
 
@@ -279,6 +286,69 @@ func tokenLoanContribution(tokenCapacity float64) float64 {
 		return -tokenCapacity
 	}
 	return 0
+}
+
+type expiredTokenSlot struct {
+	resourceGroupName string
+	clientUniqueID    uint64
+	lastReqTime       time.Time
+	slotCount         int
+}
+
+func (gtb *GroupTokenBucket) updateNextSlotExpireTime(slot *tokenSlot) {
+	expireTime := slot.lastReqTime.Add(slotExpireTimeout)
+	if gtb.nextSlotExpireTime.IsZero() || expireTime.Before(gtb.nextSlotExpireTime) {
+		gtb.nextSlotExpireTime = expireTime
+	}
+}
+
+func (gtb *GroupTokenBucket) cleanupExpiredSlots(now time.Time) []expiredTokenSlot {
+	if len(gtb.tokenSlots) == 0 {
+		gtb.nextSlotExpireTime = time.Time{}
+		return nil
+	}
+	if !gtb.nextSlotExpireTime.IsZero() && now.Before(gtb.nextSlotExpireTime) {
+		return nil
+	}
+
+	expiredSlots := make([]expiredTokenSlot, 0)
+	var nextSlotExpireTime time.Time
+	for clientUniqueID, slot := range gtb.tokenSlots {
+		expireTime := slot.lastReqTime.Add(slotExpireTimeout)
+		if now.Before(expireTime) {
+			if nextSlotExpireTime.IsZero() || expireTime.Before(nextSlotExpireTime) {
+				nextSlotExpireTime = expireTime
+			}
+			continue
+		}
+		lastReqTime := slot.lastReqTime
+		if !gtb.removeTokenSlot(clientUniqueID) {
+			continue
+		}
+		gtb.slotsExpired++
+		expiredSlots = append(expiredSlots, expiredTokenSlot{
+			resourceGroupName: gtb.resourceGroupName,
+			clientUniqueID:    clientUniqueID,
+			lastReqTime:       lastReqTime,
+			slotCount:         len(gtb.tokenSlots),
+		})
+	}
+	gtb.nextSlotExpireTime = nextSlotExpireTime
+	return expiredSlots
+}
+
+func logExpiredSlots(expiredSlots []expiredTokenSlot, extraFields ...zap.Field) {
+	for _, slot := range expiredSlots {
+		fields := []zap.Field{
+			zap.String("resource-group-name", slot.resourceGroupName),
+			zap.Time("last-req-time", slot.lastReqTime),
+			zap.Duration("expire-timeout", slotExpireTimeout),
+			zap.Uint64("del-client-id", slot.clientUniqueID),
+			zap.Int("len", slot.slotCount),
+		}
+		fields = append(fields, extraFields...)
+		log.Info("delete resource group slot because expire", fields...)
+	}
 }
 
 func (gtb *GroupTokenBucket) balanceSlotTokens(
@@ -291,6 +361,7 @@ func (gtb *GroupTokenBucket) balanceSlotTokens(
 		// Create a new slot if the slot is not exist and the required token is not 0.
 		slot = newTokenSlot(clientUniqueID, now)
 		gtb.tokenSlots[clientUniqueID] = slot
+		gtb.updateNextSlotExpireTime(slot)
 		log.Debug("create resource group slot",
 			zap.String("resource-group-name", gtb.resourceGroupName),
 			zap.Uint64("client-unique-id", clientUniqueID),
@@ -301,6 +372,7 @@ func (gtb *GroupTokenBucket) balanceSlotTokens(
 	} else if exist && requiredToken != 0 {
 		// Update the existing slot.
 		slot.lastReqTime = now
+		gtb.updateNextSlotExpireTime(slot)
 	} else if requiredToken == 0 {
 		// Clean up the slot that required 0.
 		if exist {
@@ -314,20 +386,7 @@ func (gtb *GroupTokenBucket) balanceSlotTokens(
 			gtb.slotsDeleted++
 		}
 	}
-	// Clean up the expired slots.
-	for clientUniqueID, slot := range gtb.tokenSlots {
-		if time.Since(slot.lastReqTime) >= slotExpireTimeout {
-			gtb.removeTokenSlot(clientUniqueID)
-			gtb.slotsExpired++
-			log.Info("delete resource group slot because expire",
-				zap.Time("last-req-time", slot.lastReqTime),
-				zap.Duration("expire-timeout", slotExpireTimeout),
-				zap.Uint64("client-unique-id", clientUniqueID),
-				zap.Uint64("del-client-id", clientUniqueID),
-				zap.Int("len", len(gtb.tokenSlots)))
-			continue
-		}
-	}
+	logExpiredSlots(gtb.cleanupExpiredSlots(now), zap.Uint64("client-unique-id", clientUniqueID))
 	// Do nothing if there is no slot.
 	slotNum := len(gtb.tokenSlots)
 	if slotNum == 0 {

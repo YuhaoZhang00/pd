@@ -886,13 +886,13 @@ func (m *gaugeMetrics) setGroup(group *ResourceGroup, keyspaceName string) {
 		m.overrideBurstLimitGauge.Set(float64(overrideBurstLimit))
 	}
 
-	slotMetrics := group.GetSlotMetrics()
+	slotMetrics, slotEvents := group.RefreshSlotMetrics(time.Now())
 	m.activeSlotCountGauge.Set(float64(slotMetrics.SlotCount))
 	m.tokenLoanGauge.Set(slotMetrics.TokenLoan)
-	if created, deleted, expired := group.DrainSlotEvents(); created+deleted+expired > 0 {
-		m.slotCreatedCounter.Add(float64(created))
-		m.slotDeletedCounter.Add(float64(deleted))
-		m.slotExpiredCounter.Add(float64(expired))
+	if slotEvents.Created+slotEvents.Deleted+slotEvents.Expired > 0 {
+		m.slotCreatedCounter.Add(float64(slotEvents.Created))
+		m.slotDeletedCounter.Add(float64(slotEvents.Deleted))
+		m.slotExpiredCounter.Add(float64(slotEvents.Expired))
 	}
 }
 

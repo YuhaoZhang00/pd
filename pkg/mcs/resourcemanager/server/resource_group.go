@@ -204,33 +204,56 @@ type SlotMetrics struct {
 	TokenLoan float64
 }
 
-// GetSlotMetrics returns the current token slot snapshot under the group lock.
-func (rg *ResourceGroup) GetSlotMetrics() SlotMetrics {
-	rg.RLock()
-	defer rg.RUnlock()
+// SlotEvents is the accumulated token slot lifecycle event count.
+type SlotEvents struct {
+	Created uint64
+	Deleted uint64
+	Expired uint64
+}
+
+// RefreshSlotMetrics advances the wall-clock slot lifecycle, returns the
+// current slot snapshot, and drains the accumulated slot event counts under the
+// same lock.
+func (rg *ResourceGroup) RefreshSlotMetrics(now time.Time) (slotMetrics SlotMetrics, slotEvents SlotEvents) {
+	var expiredSlots []expiredTokenSlot
+	rg.Lock()
 	if rg.RUSettings == nil || rg.RUSettings.RU == nil {
-		return SlotMetrics{}
+		rg.Unlock()
+		return
 	}
-	return SlotMetrics{
+	expiredSlots = rg.RUSettings.RU.cleanupExpiredSlots(now)
+	slotMetrics = SlotMetrics{
 		SlotCount: len(rg.RUSettings.RU.tokenSlots),
 		TokenLoan: rg.RUSettings.RU.getTokenLoan(),
 	}
+	slotEvents = rg.drainSlotEventsLocked()
+	rg.Unlock()
+
+	logExpiredSlots(expiredSlots)
+	return
 }
 
 // DrainSlotEvents returns the accumulated slot event counts and resets them.
 func (rg *ResourceGroup) DrainSlotEvents() (created, deleted, expired uint64) {
 	rg.Lock()
 	defer rg.Unlock()
+	slotEvents := rg.drainSlotEventsLocked()
+	return slotEvents.Created, slotEvents.Deleted, slotEvents.Expired
+}
+
+func (rg *ResourceGroup) drainSlotEventsLocked() SlotEvents {
 	if rg.RUSettings == nil || rg.RUSettings.RU == nil {
-		return 0, 0, 0
+		return SlotEvents{}
 	}
-	created = rg.RUSettings.RU.slotsCreated
-	deleted = rg.RUSettings.RU.slotsDeleted
-	expired = rg.RUSettings.RU.slotsExpired
+	events := SlotEvents{
+		Created: rg.RUSettings.RU.slotsCreated,
+		Deleted: rg.RUSettings.RU.slotsDeleted,
+		Expired: rg.RUSettings.RU.slotsExpired,
+	}
 	rg.RUSettings.RU.slotsCreated = 0
 	rg.RUSettings.RU.slotsDeleted = 0
 	rg.RUSettings.RU.slotsExpired = 0
-	return
+	return events
 }
 
 // PatchSettings patches the resource group settings.

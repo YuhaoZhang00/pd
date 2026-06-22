@@ -462,6 +462,40 @@ func TestOnRequestCancelSettlesOnlyPagingPrediction(t *testing.T) {
 		"OnRequestCancel must not report no-response requests to per-store completed counters")
 }
 
+func TestOnRequestCancelReportsSignedPagingPredictionDelta(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		newTokens:   100000,
+		newFillRate: 0,
+		newBurst:    0,
+	})
+
+	predictedReadBytes := uint64(4 * 1024 * 1024)
+	req := &TestRequestInfo{
+		isWrite:            false,
+		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
+	}
+
+	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+	gc.updateRunState()
+	prechargeReport := gc.collectRequestAndConsumption(periodicReport)
+	re.NotNil(prechargeReport)
+
+	cancelDelta := gc.onRequestCancelImpl(req)
+	gc.updateRunState()
+	cancelReport := gc.collectRequestAndConsumption(periodicReport)
+	re.NotNil(cancelReport)
+
+	cfg := DefaultRUConfig()
+	predictionCost := float64(cfg.ReadBytesCost) * float64(predictedReadBytes)
+	requireOnlyRRU(re, -predictionCost, cancelDelta)
+	requireOnlyRRU(re, -predictionCost, cancelReport.GetConsumptionSinceLastRequest())
+}
+
 func TestPagingPreChargeRefundOnFailedRead(t *testing.T) {
 	re := require.New(t)
 	gc := createTestGroupCostController(re)

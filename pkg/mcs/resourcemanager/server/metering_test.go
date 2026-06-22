@@ -17,6 +17,7 @@ package server
 import (
 	"testing"
 
+	"github.com/pingcap/metering_sdk/common"
 	"github.com/stretchr/testify/require"
 
 	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
@@ -79,6 +80,24 @@ func TestRUCollectorCollectSingleKeyspace(t *testing.T) {
 	re.Equal(metering.NewRUValue(20.0), record[meteringDataTiDBRUV2Field])
 	re.Equal(metering.NewRUValue(10.0), record[meteringDataTiKVRUV2Field])
 	re.Equal(metering.NewRUValue(40.0), record[meteringDataTiFlashRUV2Field])
+}
+
+func TestRUCollectorAggregateNegativeRU(t *testing.T) {
+	re := require.New(t)
+	collector := newRUCollector()
+
+	collector.Collect(&consumptionItem{
+		keyspaceName: testKeyspaceName,
+		Consumption: &rmpb.Consumption{
+			RRU: -1.0,
+		},
+		isBackground: false,
+		isTiFlash:    false,
+	})
+
+	records := collector.Aggregate()
+	re.Len(records, 1)
+	re.Equal(common.MeteringValue{Value: 0, Unit: metering.UnitRU}, records[0][meteringDataOLTPRUField])
 }
 
 func TestRUCollectorCollectMultipleKeyspaces(t *testing.T) {

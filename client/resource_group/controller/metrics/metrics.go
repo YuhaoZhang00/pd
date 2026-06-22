@@ -60,7 +60,7 @@ var (
 	PagingPrechargeCounter *prometheus.CounterVec
 	// PagingNonprechargeCounter counts coprocessor RPCs that reached the RC interceptor
 	// without a PredictedReadBytes hint (EMA cold-start). Explicitly gated by
-	// RequestInfo.IsCop() so non-cop reads (CmdGet, CmdBatchGet, CmdScan, internal lookups)
+	// optional coprocessor request metadata so non-cop reads (CmdGet, CmdBatchGet, CmdScan, internal lookups)
 	// do not pollute the metric.
 	PagingNonprechargeCounter *prometheus.CounterVec
 
@@ -70,7 +70,7 @@ var (
 	// PagingActualBytesCounter accumulates actual bytes read by pre-charged coprocessor RPCs.
 	PagingActualBytesCounter *prometheus.CounterVec
 	// PagingNonprechargeActualBytes accumulates actual bytes read by coprocessor RPCs that
-	// reached the RC interceptor without a hint (EMA cold-start). Same IsCop() gating as
+	// reached the RC interceptor without a hint (EMA cold-start). Same coprocessor gating as
 	// PagingNonprechargeCounter.
 	PagingNonprechargeActualBytes *prometheus.CounterVec
 	// PagingPredictionResidualBytes records the distribution of (actual - predicted) read
@@ -204,7 +204,7 @@ func initMetrics(constLabels prometheus.Labels) {
 			Namespace:   namespace,
 			Subsystem:   requestSubsystem,
 			Name:        "paging_nonprecharge_total",
-			Help:        "Counter of coprocessor RPCs that reached the RC interceptor without a PredictedReadBytes hint (EMA cold-start). Gated on RequestInfo.IsCop() so non-cop reads do not inflate the metric. These RPCs skip pre-charge and settle on actual read bytes only.",
+			Help:        "Counter of coprocessor RPCs that reached the RC interceptor without a PredictedReadBytes hint (EMA cold-start). Gated on optional coprocessor request metadata so non-cop reads do not inflate the metric. These RPCs skip pre-charge and settle on actual read bytes only.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})
 

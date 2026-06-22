@@ -56,6 +56,9 @@ type RequestInfo interface {
 	// controller only uses it for coprocessor reads; non-cop hints are
 	// ignored by paging accounting.
 	PredictedReadBytes() uint64
+}
+
+type copRequestInfo interface {
 	// IsCop reports whether this request targets the coprocessor endpoint
 	// (CmdCop / CmdCopStream). Only coprocessor reads participate in paging
 	// pre-charge, settlement, and metrics; point gets, batch gets, scans and
@@ -64,10 +67,15 @@ type RequestInfo interface {
 	IsCop() bool
 }
 
+func isCopRequest(req RequestInfo) bool {
+	copReq, ok := req.(copRequestInfo)
+	return ok && copReq.IsCop()
+}
+
 // pagingReadEstimate returns the predicted read-byte basis for paging
 // accounting. Only coprocessor reads with a positive hint are eligible.
 func pagingReadEstimate(req RequestInfo) (uint64, bool) {
-	if req.IsWrite() || !req.IsCop() {
+	if req.IsWrite() || !isCopRequest(req) {
 		return 0, false
 	}
 	predicted := req.PredictedReadBytes()

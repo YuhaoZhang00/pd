@@ -77,7 +77,7 @@ func (tri *TestRequestInfo) PredictedReadBytes() uint64 {
 	return tri.predictedReadBytes
 }
 
-// IsCop implements the RequestInfo interface.
+// IsCop implements the optional coprocessor request metadata interface.
 func (tri *TestRequestInfo) IsCop() bool {
 	return tri.isCop
 }

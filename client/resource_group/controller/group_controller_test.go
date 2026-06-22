@@ -61,6 +61,38 @@ func requireOnlyRRU(re *require.Assertions, expectedRRU float64, consumption *rm
 	re.Zero(consumption.TiflashRUV2)
 }
 
+type legacyRequestInfo struct {
+	req TestRequestInfo
+}
+
+func (l *legacyRequestInfo) IsWrite() bool {
+	return l.req.IsWrite()
+}
+
+func (l *legacyRequestInfo) WriteBytes() uint64 {
+	return l.req.WriteBytes()
+}
+
+func (l *legacyRequestInfo) ReplicaNumber() int64 {
+	return l.req.ReplicaNumber()
+}
+
+func (l *legacyRequestInfo) StoreID() uint64 {
+	return l.req.StoreID()
+}
+
+func (l *legacyRequestInfo) RequestSize() uint64 {
+	return l.req.RequestSize()
+}
+
+func (l *legacyRequestInfo) AccessLocationType() AccessLocationType {
+	return l.req.AccessLocationType()
+}
+
+func (l *legacyRequestInfo) PredictedReadBytes() uint64 {
+	return l.req.PredictedReadBytes()
+}
+
 func createTestGroupCostController(re *require.Assertions) *groupCostController {
 	group := &rmpb.ResourceGroup{
 		Name:     "test",
@@ -575,6 +607,40 @@ func TestNonCopPredictedReadBytesNoResponseDoesNotPrechargeOrCancel(t *testing.T
 		"non-cop cancel must not refund a paging hint that was ignored")
 	re.InDelta(tokensBefore-baseCost, tokensAfterCancel, 1.0,
 		"non-cop no-response request keeps the normal read base cost charged")
+}
+
+func TestLegacyRequestInfoPredictedReadBytesNoResponseDoesNotPrechargeOrCancel(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	initialTokens := float64(100000)
+	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		newTokens:   initialTokens,
+		newFillRate: 0,
+		newBurst:    0,
+	})
+	tokensBefore := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+
+	req := &legacyRequestInfo{
+		req: TestRequestInfo{
+			predictedReadBytes: 4 * 1024 * 1024,
+		},
+	}
+
+	delta, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+	cfg := DefaultRUConfig()
+	baseCost := float64(cfg.ReadBaseCost) + float64(cfg.ReadPerBatchBaseCost)*defaultAvgBatchProportion
+	re.InDelta(baseCost, delta.RRU, 1e-6)
+	tokensAfterRequest := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+
+	cancelDelta := gc.onRequestCancelImpl(req)
+	tokensAfterCancel := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+	requireOnlyRRU(re, 0, cancelDelta)
+	re.InDelta(tokensAfterRequest, tokensAfterCancel, 1e-6,
+		"legacy request info without coprocessor metadata must not refund paging")
+	re.InDelta(tokensBefore-baseCost, tokensAfterCancel, 1.0,
+		"legacy no-response request keeps the normal read base cost charged")
 }
 
 func TestNonCopPredictedReadBytesResponseIgnoresPagingAccounting(t *testing.T) {

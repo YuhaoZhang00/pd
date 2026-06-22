@@ -185,7 +185,7 @@ func (gmc *groupMetricsCollection) observePagingActual(predicted, actual uint64,
 }
 
 // observePagingNonprecharge counts a coprocessor RPC whose EMA produced no hint
-// (cold-start). Callers must gate the call on RequestInfo.IsCop() && !IsWrite()
+// (cold-start). Callers must gate the call on isCopRequest() && !IsWrite()
 // so the metric stays scoped to coprocessor reads and excludes point gets,
 // batch gets, scans, and other bounded-size reads.
 func (gmc *groupMetricsCollection) observePagingNonprecharge(actual uint64) {
@@ -685,7 +685,7 @@ func (gc *groupCostController) onResponseImpl(
 	if bytesForEst := estimatedReadBytes(req); bytesForEst > 0 {
 		gc.metrics.observePagingActual(bytesForEst, resp.ReadBytes(),
 			getRUValueFromConsumption(count), getRUValueFromConsumption(delta))
-	} else if !req.IsWrite() && req.IsCop() {
+	} else if !req.IsWrite() && isCopRequest(req) {
 		gc.metrics.observePagingNonprecharge(resp.ReadBytes())
 	}
 	if !gc.burstable.Load() {
@@ -723,7 +723,7 @@ func (gc *groupCostController) onResponseWaitImpl(
 	if bytesForEst := estimatedReadBytes(req); bytesForEst > 0 {
 		gc.metrics.observePagingActual(bytesForEst, resp.ReadBytes(),
 			getRUValueFromConsumption(count), getRUValueFromConsumption(delta))
-	} else if !req.IsWrite() && req.IsCop() {
+	} else if !req.IsWrite() && isCopRequest(req) {
 		gc.metrics.observePagingNonprecharge(resp.ReadBytes())
 	}
 	var waitDuration time.Duration

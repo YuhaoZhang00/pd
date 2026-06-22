@@ -484,8 +484,10 @@ func TestOnRequestCancelReportsSignedPagingPredictionDelta(t *testing.T) {
 	gc.updateRunState()
 	prechargeReport := gc.collectRequestAndConsumption(periodicReport)
 	re.NotNil(prechargeReport)
+	gc.handleTokenBucketResponse(&rmpb.TokenBucketResponse{})
 
 	cancelDelta := gc.onRequestCancelImpl(req)
+	gc.run.lastRequestTime = time.Now().Add(-defaultTargetPeriod)
 	gc.updateRunState()
 	cancelReport := gc.collectRequestAndConsumption(periodicReport)
 	re.NotNil(cancelReport)

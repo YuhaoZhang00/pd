@@ -402,11 +402,18 @@ func (gc *groupCostController) shouldReportConsumption() bool {
 		if timeSinceLastRequest >= extendedReportingPeriodFactor*defaultTargetPeriod {
 			return true
 		}
+		if hasNegativeRequestUnitDelta(gc.run.lastRequestConsumption, gc.run.consumption) {
+			return true
+		}
 		if getRUValueFromConsumption(gc.run.consumption)-getRUValueFromConsumption(gc.run.lastRequestConsumption) >= consumptionsReportingThreshold {
 			return true
 		}
 	}
 	return false
+}
+
+func hasNegativeRequestUnitDelta(last, now *rmpb.Consumption) bool {
+	return now.RRU < last.RRU || now.WRU < last.WRU
 }
 
 func (gc *groupCostController) handleTokenBucketResponse(resp *rmpb.TokenBucketResponse) {

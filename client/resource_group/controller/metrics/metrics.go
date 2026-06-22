@@ -55,8 +55,8 @@ var (
 	SuccessfulTokenRequestDuration prometheus.Observer
 
 	// PagingPrechargeCounter counts coprocessor RPCs that triggered RC paging pre-charge
-	// (PredictedReadBytes hint > 0). Self-gated to coprocessor reads because non-cop callers
-	// never set the hint.
+	// (PredictedReadBytes hint > 0). Explicitly gated to coprocessor reads; non-cop
+	// hints are ignored by paging accounting.
 	PagingPrechargeCounter *prometheus.CounterVec
 	// PagingNonprechargeCounter counts coprocessor RPCs that reached the RC interceptor
 	// without a PredictedReadBytes hint (EMA cold-start). Explicitly gated by
@@ -245,7 +245,7 @@ func initMetrics(constLabels prometheus.Labels) {
 			// prior observation (predicted=0) and workload shifts that
 			// leave the prediction above actual. Factor-4 spacing keeps
 			// resolution near zero.
-			Buckets: []float64{-67108864, -16777216, -4194304, -1048576, -262144, -65536, -16384, -4096, 0, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864},
+			Buckets:     []float64{-67108864, -16777216, -4194304, -1048576, -262144, -65536, -16384, -4096, 0, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864},
 			Help:        "Histogram of (actual_read_bytes - predicted_read_bytes) for pre-charged coprocessor RPCs. Shows predictor accuracy.",
 			ConstLabels: constLabels,
 		}, []string{newResourceGroupNameLabel})

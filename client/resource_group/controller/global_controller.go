@@ -76,12 +76,12 @@ type ResourceGroupKVInterceptor interface {
 	// OnResponseWait is used to consume tokens after receiving a response. If the response requires many tokens, we need to wait for the tokens.
 	// This is an optimized version of OnResponse for cases where the response requires many tokens, making the debt smaller and smoother.
 	OnResponseWait(ctx context.Context, resourceGroupName string, req RequestInfo, resp ResponseInfo) (*rmpb.Consumption, time.Duration, error)
-	// OnRequestCancel undoes the pre-charge performed by a preceding successful
-	// OnRequestWait when the underlying RPC fails before producing a response
-	// (e.g. transport error, context cancellation). Without this, the predicted
-	// RU pre-charged in BeforeKVRequest would stay permanently debited.
-	// Callers must invoke it exactly once per cancelled request, with the same
-	// RequestInfo that was passed to OnRequestWait.
+	// OnRequestCancel settles a preceding successful OnRequestWait when the
+	// underlying RPC fails before producing a response (e.g. transport error,
+	// context cancellation). A nil response does not prove TiKV never executed
+	// the request, so implementations must not roll back normal request-side
+	// read base cost or write WRU. Callers that need to update client-side
+	// RUDetails should use OnRequestCancelWithDelta when available.
 	OnRequestCancel(ctx context.Context, resourceGroupName string, info RequestInfo)
 	// IsBackgroundRequest If the resource group has background jobs, we should not record consumption and wait for it.
 	IsBackgroundRequest(ctx context.Context, resourceGroupName, requestResource string) bool
@@ -765,15 +765,23 @@ func (c *ResourceGroupsController) OnResponseWait(
 
 // OnRequestCancel implements ResourceGroupKVInterceptor.
 func (c *ResourceGroupsController) OnRequestCancel(
-	_ context.Context, resourceGroupName string, info RequestInfo,
+	ctx context.Context, resourceGroupName string, info RequestInfo,
 ) {
+	c.OnRequestCancelWithDelta(ctx, resourceGroupName, info)
+}
+
+// OnRequestCancelWithDelta settles no-response request accounting and returns
+// the signed delta that callers should apply to client-side RUDetails.
+func (c *ResourceGroupsController) OnRequestCancelWithDelta(
+	_ context.Context, resourceGroupName string, info RequestInfo,
+) *rmpb.Consumption {
 	gc, ok := c.loadGroupController(resourceGroupName)
 	if !ok {
 		log.Warn("[resource group controller] resource group name does not exist on cancel",
 			zap.String("name", resourceGroupName))
-		return
+		return &rmpb.Consumption{}
 	}
-	gc.onRequestCancelImpl(info)
+	return gc.onRequestCancelImpl(info)
 }
 
 // IsBackgroundRequest If the resource group has background jobs, we should not record consumption and wait for it.

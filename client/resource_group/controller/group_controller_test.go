@@ -36,6 +36,31 @@ func counterValue(re *require.Assertions, c interface{ Write(*dto.Metric) error 
 	return m.GetCounter().GetValue()
 }
 
+func cloneConsumption(consumption *rmpb.Consumption) *rmpb.Consumption {
+	if consumption == nil {
+		return nil
+	}
+	cloned := *consumption
+	return &cloned
+}
+
+func requireOnlyRRU(re *require.Assertions, expectedRRU float64, consumption *rmpb.Consumption) {
+	re.NotNil(consumption)
+	re.InDelta(expectedRRU, consumption.RRU, 1e-6)
+	re.Zero(consumption.WRU)
+	re.Zero(consumption.ReadBytes)
+	re.Zero(consumption.WriteBytes)
+	re.Zero(consumption.TotalCpuTimeMs)
+	re.Zero(consumption.SqlLayerCpuTimeMs)
+	re.Zero(consumption.KvReadRpcCount)
+	re.Zero(consumption.KvWriteRpcCount)
+	re.Zero(consumption.ReadCrossAzTrafficBytes)
+	re.Zero(consumption.WriteCrossAzTrafficBytes)
+	re.Zero(consumption.TikvRUV2)
+	re.Zero(consumption.TidbRUV2)
+	re.Zero(consumption.TiflashRUV2)
+}
+
 func createTestGroupCostController(re *require.Assertions) *groupCostController {
 	group := &rmpb.ResourceGroup{
 		Name:     "test",
@@ -228,6 +253,7 @@ func TestPredictedReadBytesPreCharge(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
 	}
 	precharge := &rmpb.Consumption{}
 	kvCalc.BeforeKVRequest(precharge, req)
@@ -275,6 +301,7 @@ func TestPagingPreChargeTokenRefund(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
 	}
 	resp := &TestResponseInfo{
 		readBytes: actualReadBytes,
@@ -324,6 +351,7 @@ func TestPagingPreChargeNoRefundWhenActualExceedsEstimate(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
 	}
 	resp := &TestResponseInfo{
 		readBytes: actualReadBytes,
@@ -359,6 +387,7 @@ func TestOnResponseImplPagingRefund(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
 	}
 	resp := &TestResponseInfo{
 		readBytes: actualReadBytes,
@@ -377,24 +406,23 @@ func TestOnResponseImplPagingRefund(t *testing.T) {
 		"onResponseImpl should refund excess pre-charged tokens")
 }
 
-func TestOnRequestCancelRefundsPreCharge(t *testing.T) {
+func TestOnRequestCancelSettlesOnlyPagingPrediction(t *testing.T) {
 	re := require.New(t)
 	gc := createTestGroupCostController(re)
 
+	initialTokens := float64(100000)
 	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
-		newTokens:   100000,
+		newTokens:   initialTokens,
 		newFillRate: 0,
 		newBurst:    0,
 	})
 	tokensBefore := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
-	gc.mu.Lock()
-	consumptionBefore := gc.mu.consumption.RRU
-	gc.mu.Unlock()
-
 	predictedReadBytes := uint64(4 * 1024 * 1024) // 4 MiB pre-charge
+	storeID := uint64(42)
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		storeID:            storeID,
 		isCop:              true,
 	}
 
@@ -402,25 +430,36 @@ func TestOnRequestCancelRefundsPreCharge(t *testing.T) {
 	re.NoError(err)
 	tokensAfterPrecharge := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
 	gc.mu.Lock()
-	consumptionAfterPrecharge := gc.mu.consumption.RRU
+	consumptionAfterPrecharge := cloneConsumption(gc.mu.consumption)
+	globalAfterPrecharge := cloneConsumption(gc.mu.globalCounter)
+	storeAfterPrecharge := cloneConsumption(gc.mu.storeCounter[storeID])
 	gc.mu.Unlock()
 	re.Less(tokensAfterPrecharge, tokensBefore, "sanity: precharge debited the bucket")
-	re.Greater(consumptionAfterPrecharge, consumptionBefore, "sanity: precharge added to consumption")
+	re.Greater(consumptionAfterPrecharge.RRU, 0.0, "sanity: precharge added to consumption")
 
 	// Simulate transport-level RPC failure: no response was produced, so the
-	// settlement path never runs. OnRequestCancel must roll back the
-	// speculative debit.
-	gc.onRequestCancelImpl(req)
+	// controller cannot tell whether TiKV executed the request. Only the paging
+	// read-byte prediction is settled as a signed response-side delta.
+	cancelDelta := gc.onRequestCancelImpl(req)
 
 	tokensAfterCancel := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
 	gc.mu.Lock()
-	consumptionAfterCancel := gc.mu.consumption.RRU
+	consumptionAfterCancel := cloneConsumption(gc.mu.consumption)
+	globalAfterCancel := cloneConsumption(gc.mu.globalCounter)
+	storeAfterCancel := cloneConsumption(gc.mu.storeCounter[storeID])
 	gc.mu.Unlock()
 
-	re.InDelta(tokensBefore, tokensAfterCancel, 1.0,
-		"OnRequestCancel must refund every pre-charged token")
-	re.InDelta(consumptionBefore, consumptionAfterCancel, 1e-6,
-		"OnRequestCancel must reverse the consumption recorded by OnRequestWait")
+	cfg := DefaultRUConfig()
+	predictionCost := float64(cfg.ReadBytesCost) * float64(predictedReadBytes)
+	requireOnlyRRU(re, -predictionCost, cancelDelta)
+	re.InDelta(tokensAfterPrecharge+predictionCost, tokensAfterCancel, 1.0,
+		"OnRequestCancel must refund only the predicted read-byte pre-charge")
+	re.InDelta(consumptionAfterPrecharge.RRU-predictionCost, consumptionAfterCancel.RRU, 1e-6,
+		"OnRequestCancel must keep the request-side read base cost charged")
+	re.Equal(globalAfterPrecharge, globalAfterCancel,
+		"OnRequestCancel must not report no-response requests to global completed counters")
+	re.Equal(storeAfterPrecharge, storeAfterCancel,
+		"OnRequestCancel must not report no-response requests to per-store completed counters")
 }
 
 func TestPagingPreChargeRefundOnFailedRead(t *testing.T) {
@@ -439,6 +478,7 @@ func TestPagingPreChargeRefundOnFailedRead(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: predictedReadBytes,
+		isCop:              true,
 	}
 	// Failed response: no bytes read, no CPU consumed, succeed=false.
 	resp := &TestResponseInfo{
@@ -463,6 +503,116 @@ func TestPagingPreChargeRefundOnFailedRead(t *testing.T) {
 	expectedRefund := float64(cfg.ReadBytesCost) * float64(predictedReadBytes)
 	re.InDelta(tokensAfterPreCharge+expectedRefund, tokensAfterSettlement, 1.0,
 		"failed read with paging hint should refund ReadBytesCost*predicted")
+}
+
+func TestNonCopPredictedReadBytesNoResponseDoesNotPrechargeOrCancel(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	initialTokens := float64(100000)
+	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		newTokens:   initialTokens,
+		newFillRate: 0,
+		newBurst:    0,
+	})
+	tokensBefore := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+
+	predictedReadBytes := uint64(4 * 1024 * 1024)
+	req := &TestRequestInfo{
+		isWrite:            false,
+		predictedReadBytes: predictedReadBytes,
+		isCop:              false,
+	}
+
+	delta, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+	cfg := DefaultRUConfig()
+	baseCost := float64(cfg.ReadBaseCost) + float64(cfg.ReadPerBatchBaseCost)*defaultAvgBatchProportion
+	re.InDelta(baseCost, delta.RRU, 1e-6,
+		"non-cop read hints must be ignored by paging pre-charge")
+	tokensAfterRequest := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+
+	cancelDelta := gc.onRequestCancelImpl(req)
+	tokensAfterCancel := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+	requireOnlyRRU(re, 0, cancelDelta)
+	re.InDelta(tokensAfterRequest, tokensAfterCancel, 1e-6,
+		"non-cop cancel must not refund a paging hint that was ignored")
+	re.InDelta(tokensBefore-baseCost, tokensAfterCancel, 1.0,
+		"non-cop no-response request keeps the normal read base cost charged")
+}
+
+func TestNonCopPredictedReadBytesResponseIgnoresPagingAccounting(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	predictedReadBytes := uint64(4 * 1024 * 1024)
+	actualReadBytes := uint64(512 * 1024)
+	req := &TestRequestInfo{
+		isWrite:            false,
+		predictedReadBytes: predictedReadBytes,
+		isCop:              false,
+	}
+	resp := &TestResponseInfo{
+		readBytes: actualReadBytes,
+		kvCPU:     10 * time.Millisecond,
+		succeed:   true,
+	}
+
+	prechargeBefore := counterValue(re, gc.metrics.prechargeCounter)
+	actualBefore := counterValue(re, gc.metrics.actualBytesCounter)
+	nonprechargeBefore := counterValue(re, gc.metrics.nonprechargeCounter)
+	delta, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+	cfg := DefaultRUConfig()
+	baseCost := float64(cfg.ReadBaseCost) + float64(cfg.ReadPerBatchBaseCost)*defaultAvgBatchProportion
+	re.InDelta(baseCost, delta.RRU, 1e-6,
+		"non-cop read hints must not add predicted read bytes to pre-charge")
+
+	settlement, err := gc.onResponseImpl(req, resp)
+	re.NoError(err)
+	actualReadCost := float64(cfg.ReadBytesCost) * float64(actualReadBytes)
+	cpuCost := float64(cfg.CPUMsCost) * 10.0
+	re.InDelta(actualReadCost+cpuCost, settlement.RRU, 1e-6,
+		"non-cop response settlement must bill actual read bytes and CPU without subtracting the ignored hint")
+	re.InDelta(prechargeBefore, counterValue(re, gc.metrics.prechargeCounter), 1e-9)
+	re.InDelta(actualBefore, counterValue(re, gc.metrics.actualBytesCounter), 1e-9)
+	re.InDelta(nonprechargeBefore, counterValue(re, gc.metrics.nonprechargeCounter), 1e-9)
+}
+
+func TestOnRequestCancelDoesNotRollBackWriteCost(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+
+	gc.run.requestUnitTokens.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		newTokens:   100000,
+		newFillRate: 0,
+		newBurst:    0,
+	})
+	req := &TestRequestInfo{
+		isWrite:     true,
+		writeBytes:  1024,
+		numReplicas: 1,
+		storeID:     7,
+	}
+
+	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
+	re.NoError(err)
+	tokensAfterRequest := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+	gc.mu.Lock()
+	consumptionAfterRequest := cloneConsumption(gc.mu.consumption)
+	gc.mu.Unlock()
+
+	cancelDelta := gc.onRequestCancelImpl(req)
+	tokensAfterCancel := gc.run.requestUnitTokens.limiter.AvailableTokens(time.Now())
+	gc.mu.Lock()
+	consumptionAfterCancel := cloneConsumption(gc.mu.consumption)
+	gc.mu.Unlock()
+
+	requireOnlyRRU(re, 0, cancelDelta)
+	re.InDelta(tokensAfterRequest, tokensAfterCancel, 1e-6,
+		"write no-response cancel must not refund request-side WRU")
+	re.Equal(consumptionAfterRequest, consumptionAfterCancel,
+		"write no-response cancel must not roll back request-side consumption")
 }
 
 func TestDeletePagingLabelsResetsSeries(t *testing.T) {
@@ -581,6 +731,7 @@ func TestPagingPrechargeNotObservedOnThrottle(t *testing.T) {
 	req := &TestRequestInfo{
 		isWrite:            false,
 		predictedReadBytes: 4 * 1024 * 1024 * 1024,
+		isCop:              true,
 	}
 
 	before := counterValue(re, gc.metrics.prechargeCounter)

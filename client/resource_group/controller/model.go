@@ -52,26 +52,33 @@ type RequestInfo interface {
 	StoreID() uint64
 	RequestSize() uint64
 	AccessLocationType() AccessLocationType
-	// PredictedReadBytes returns the read-bytes hint used for RC paging
-	// pre-charge in BeforeKVRequest and settled symmetrically in
-	// AfterKVRequest. Return 0 to opt out; writes always return 0.
+	// PredictedReadBytes returns the caller-supplied read-bytes hint. The
+	// controller only uses it for coprocessor reads; non-cop hints are
+	// ignored by paging accounting.
 	PredictedReadBytes() uint64
 	// IsCop reports whether this request targets the coprocessor endpoint
-	// (CmdCop / CmdCopStream). Only coprocessor reads participate in the
-	// paging_* accounting; point gets, batch gets, scans and other
-	// bounded-size reads bypass the paging metrics even though they may
-	// reach this controller through the same RC interceptor.
+	// (CmdCop / CmdCopStream). Only coprocessor reads participate in paging
+	// pre-charge, settlement, and metrics; point gets, batch gets, scans and
+	// other bounded-size reads bypass paging even when they carry a
+	// PredictedReadBytes hint.
 	IsCop() bool
 }
 
-// estimatedReadBytes returns the predicted read-bytes hint for read requests.
-// Writes always return 0 so paging pre-charge / settlement / metrics stay
-// gated to reads.
-func estimatedReadBytes(req RequestInfo) uint64 {
-	if req.IsWrite() {
-		return 0
+// pagingReadEstimate returns the predicted read-byte basis for paging
+// accounting. Only coprocessor reads with a positive hint are eligible.
+func pagingReadEstimate(req RequestInfo) (uint64, bool) {
+	if req.IsWrite() || !req.IsCop() {
+		return 0, false
 	}
-	return req.PredictedReadBytes()
+	predicted := req.PredictedReadBytes()
+	return predicted, predicted > 0
+}
+
+// estimatedReadBytes returns the predicted read-bytes hint used by paging
+// pre-charge and settlement.
+func estimatedReadBytes(req RequestInfo) uint64 {
+	predicted, _ := pagingReadEstimate(req)
+	return predicted
 }
 
 // ResponseInfo is the interface of the response information provider. A response should be
@@ -270,11 +277,11 @@ func add(custom1 *rmpb.Consumption, custom2 *rmpb.Consumption) {
 
 func updateDeltaConsumption(last *rmpb.Consumption, now *rmpb.Consumption) *rmpb.Consumption {
 	delta := &rmpb.Consumption{}
-	if now.RRU > last.RRU {
+	if now.RRU != last.RRU {
 		delta.RRU = now.RRU - last.RRU
 		last.RRU = now.RRU
 	}
-	if now.WRU > last.WRU {
+	if now.WRU != last.WRU {
 		delta.WRU = now.WRU - last.WRU
 		last.WRU = now.WRU
 	}

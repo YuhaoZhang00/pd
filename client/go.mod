@@ -2,7 +2,7 @@ module github.com/tikv/pd/client
 
 go 1.25.10
 
-replace github.com/pingcap/kvproto => github.com/YuhaoZhang00/kvproto v0.0.0-20260624120537-6017aaa77a41
+replace github.com/pingcap/kvproto => github.com/YuhaoZhang00/kvproto v0.0.0-20260629094258-88fa8d673cc4
 
 require (
 	github.com/BurntSushi/toml v0.3.1
